@@ -81,7 +81,7 @@ static uint16_t g_listen_port = 0;
 static pcap_t   *g_handle     = NULL;
 static int       g_running    = 1;
 static run_mode_t g_mode      = MODE_NONE;
-static int       g_interactive = 1;
+static int       g_interactive = 0;
 static int       g_test_mode  = 0;
 static int       g_protocol   = PROTO_UDP;  /* PROTO_UDP or PROTO_TCP */
 
@@ -1441,16 +1441,25 @@ int main(int argc, char *argv[])
     }
 
     if (g_test_mode) {
+        /* iperf test mode: only print bandwidth */
         if (g_mode == MODE_CLIENT) {
             iperf_client_test();
         } else {
             iperf_server_test();
         }
     } else if (g_interactive) {
+        /* Interactive mode: print packet payload details */
         if (g_mode == MODE_SERVER) {
             server_interactive_loop();
         } else {
             client_interactive_loop();
+        }
+    } else {
+        /* Default: client=interactive, server=bandwidth-only */
+        if (g_mode == MODE_CLIENT) {
+            client_interactive_loop();
+        } else {
+            iperf_server_test();
         }
     }
 
