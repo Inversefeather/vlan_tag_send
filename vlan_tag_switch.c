@@ -1114,14 +1114,17 @@ static void iperf_server_test(void)
 
         double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
         if (interval_sec >= 1.0) {
-            double bps = (double)interval_bytes * 8 / interval_sec;
-            char bw_str[32], bytes_str[32];
-            format_bps(bps, bw_str, sizeof(bw_str));
-            format_bytes(interval_bytes, bytes_str, sizeof(bytes_str));
-            printf("  [%5.1fs] %s  %s/s  %llu packets\n",
-                   (double)(now.QuadPart - start.QuadPart) / freq.QuadPart,
-                   bytes_str, bw_str,
-                   (unsigned long long)interval_pkts);
+            /* Only print if we received packets this interval */
+            if (interval_pkts > 0) {
+                double bps = (double)interval_bytes * 8 / interval_sec;
+                char bw_str[32], bytes_str[32];
+                format_bps(bps, bw_str, sizeof(bw_str));
+                format_bytes(interval_bytes, bytes_str, sizeof(bytes_str));
+                printf("  [%5.1fs] %s  %s/s  %llu packets\n",
+                       (double)(now.QuadPart - start.QuadPart) / freq.QuadPart,
+                       bytes_str, bw_str,
+                       (unsigned long long)interval_pkts);
+            }
 
             interval_bytes = 0;
             interval_pkts = 0;
