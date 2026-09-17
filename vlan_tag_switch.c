@@ -1055,6 +1055,10 @@ static void iperf_server_test(void)
     printf("========================================\n\n");
 
     int is_tcp = 0;
+    LARGE_INTEGER last_pkt_time;
+    QueryPerformanceCounter(&last_pkt_time);
+    #define SILENCE_TIMEOUT_MS  3000  /* auto-stop after 3s of no packets */
+
     while (g_running) {
         int payload_len = recv_packet(g_listen_port, src_mac, src_ip, &src_port,
                                       payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp, g_protocol);
@@ -1080,10 +1084,21 @@ static void iperf_server_test(void)
             total_pkts++;
             interval_bytes += payload_len + hdr_len + IP_HDR_LEN + transport_hdr_len;
             interval_pkts++;
+
+            /* Reset silence timer on every received packet */
+            QueryPerformanceCounter(&last_pkt_time);
         }
 
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
+
+        /* Check silence timeout - auto stop if no packets for SILENCE_TIMEOUT_MS */
+        double silence_ms = (double)(now.QuadPart - last_pkt_time.QuadPart) * 1000.0 / freq.QuadPart;
+        if (!first_pkt && silence_ms >= SILENCE_TIMEOUT_MS) {
+            printf("  [Timeout] No packets received for %.0f ms, stopping...\n", silence_ms);
+            break;
+        }
+
         double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
         if (interval_sec >= 1.0) {
             double bps = (double)interval_bytes * 8 / interval_sec;
