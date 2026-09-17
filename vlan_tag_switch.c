@@ -1087,8 +1087,6 @@ static void iperf_server_test(void)
 
             if (first_pkt) {
                 first_pkt = 0;
-                printf("  [First Pkt] From %u.%u.%u.%u:%u\n",
-                       src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port);
             }
 
             int transport_hdr_len = (g_protocol == PROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
@@ -1108,7 +1106,6 @@ static void iperf_server_test(void)
         /* Check silence timeout - auto stop if no packets for silence_timeout_ms */
         double silence_ms = (double)(now.QuadPart - last_pkt_time.QuadPart) * 1000.0 / freq.QuadPart;
         if (!first_pkt && silence_ms >= silence_timeout_ms) {
-            printf("  [Timeout] No packets received for %.0f ms, stopping...\n", silence_ms);
             break;
         }
 
