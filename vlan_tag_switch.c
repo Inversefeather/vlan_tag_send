@@ -1158,6 +1158,7 @@ static void usage(const char *prog)
     printf("  %s -c <server_ip:port> -t [-b <bw>] [-d <sec>] [-l <len>] [-v <vlan_id>]  iperf test\n", prog);
     printf("\n");
     printf("Options:\n");
+    printf("  -h              Show this help message\n");
     printf("  -l              List available adapters\n");
     printf("  -s              Server mode\n");
     printf("  -c <ip:port>    Client mode, specify server address\n");
@@ -1241,6 +1242,9 @@ int main(int argc, char *argv[])
             printf("Available adapters:\n");
             list_adapters(alldevs);
             pcap_freealldevs(alldevs);
+            return 0;
+        } else if (strcmp(argv[arg_idx], "-h") == 0 || strcmp(argv[arg_idx], "--help") == 0) {
+            usage(argv[0]);
             return 0;
         } else if (strcmp(argv[arg_idx], "-s") == 0) {
             g_mode = MODE_SERVER;
