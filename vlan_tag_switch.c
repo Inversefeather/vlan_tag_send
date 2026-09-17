@@ -88,6 +88,7 @@ static int       g_protocol   = PROTO_UDP;  /* PROTO_UDP or PROTO_TCP */
 /* Test parameters */
 static double   g_target_bps  = 0;
 static int      g_test_duration = 10;
+static int      g_silence_timeout = 3;  /* server auto-stop after N seconds of silence */
 static int      g_pkt_size    = 1400;
 
 /*=======================================================================
@@ -1052,12 +1053,13 @@ static void iperf_server_test(void)
     } else {
         printf("  VLAN: None\n");
     }
+    printf("  Timeout: %d sec (auto-stop after silence)\n", g_silence_timeout);
     printf("========================================\n\n");
 
     int is_tcp = 0;
     LARGE_INTEGER last_pkt_time;
     QueryPerformanceCounter(&last_pkt_time);
-    #define SILENCE_TIMEOUT_MS  3000  /* auto-stop after 3s of no packets */
+    int silence_timeout_ms = g_silence_timeout * 1000;
 
     while (g_running) {
         int payload_len = recv_packet(g_listen_port, src_mac, src_ip, &src_port,
@@ -1092,9 +1094,9 @@ static void iperf_server_test(void)
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
 
-        /* Check silence timeout - auto stop if no packets for SILENCE_TIMEOUT_MS */
+        /* Check silence timeout - auto stop if no packets for silence_timeout_ms */
         double silence_ms = (double)(now.QuadPart - last_pkt_time.QuadPart) * 1000.0 / freq.QuadPart;
-        if (!first_pkt && silence_ms >= SILENCE_TIMEOUT_MS) {
+        if (!first_pkt && silence_ms >= silence_timeout_ms) {
             printf("  [Timeout] No packets received for %.0f ms, stopping...\n", silence_ms);
             break;
         }
@@ -1166,7 +1168,8 @@ static void usage(const char *prog)
     printf("  -v <vlan_id>    VLAN ID (optional, no VLAN tag if not specified)\n");
     printf("  -P <protocol>   Transport protocol: udp (default) or tcp\n");
     printf("  -b <bandwidth>  Target bandwidth (e.g. 100M, 1G, default unlimited)\n");
-    printf("  -d <duration>   Test duration in seconds (default 10)\n");
+    printf("  -d <duration>   Client test duration in seconds (default 10)\n");
+    printf("  -T <timeout>    Server auto-stop silence timeout in seconds (default 3)\n");
     printf("  -l <length>     Packet payload size (default 1400)\n");
     printf("\n");
     printf("Description:\n");
@@ -1183,6 +1186,7 @@ static void usage(const char *prog)
     printf("  %s -c 192.168.1.100:9999 -P tcp -v 100  # TCP with VLAN 100\n", prog);
     printf("  %s -c 192.168.1.100:9999 -t -b 100M -d 30\n", prog);
     printf("  %s -c 192.168.1.100:9999 -t -b 1G -P tcp -v 100\n", prog);
+    printf("  %s -s -p 9999 -t -T 30            # server waits 30s before auto-stop\n", prog);
 }
 
 static double parse_bandwidth(const char *str)
@@ -1288,6 +1292,13 @@ int main(int argc, char *argv[])
                 return 1;
             }
             arg_idx += 2;
+        } else if (strcmp(argv[arg_idx], "-T") == 0 && arg_idx + 1 < argc) {
+            g_silence_timeout = atoi(argv[arg_idx + 1]);
+            if (g_silence_timeout < 1 || g_silence_timeout > 300) {
+                fprintf(stderr, "Error: timeout must be between 1-300\n");
+                return 1;
+            }
+            arg_idx += 2;
         } else if (strcmp(argv[arg_idx], "-l") == 0 && arg_idx + 1 < argc) {
             g_pkt_size = atoi(argv[arg_idx + 1]);
             if (g_pkt_size < 64 || g_pkt_size > 1472) {
@@ -1388,6 +1399,7 @@ int main(int argc, char *argv[])
             printf(" Target BW : Unlimited\n");
         }
         printf(" Duration  : %d sec\n", g_test_duration);
+        printf(" Timeout   : %d sec (server auto-stop)\n", g_silence_timeout);
         printf(" Pkt Size  : %d bytes\n", g_pkt_size);
     }
     printf("========================================\n");
