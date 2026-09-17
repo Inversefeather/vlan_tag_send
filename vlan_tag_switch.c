@@ -1,17 +1,18 @@
 /*
  * vlan_tag_switch.c - WinPcap/Npcap VLAN tag switch test tool (Windows)
  *
- * Function: Simulate switch behavior, L3 (IP+UDP) packets, optional L2 VLAN tag
+ * Function: Simulate switch behavior, L3 (IP+UDP or IP+TCP) packets, optional L2 VLAN tag
  *   -s (server) mode: listen on port, strip VLAN tag and print payload, reply/stats
  *   -c (client) mode: connect to server, send packets with VLAN tag, receive replies
  *   -t (test)   mode: iperf-like bandwidth test, send high traffic and statistics
  *
  * VLAN optional: without -v no VLAN tag, with -v <vlan_id> adds VLAN tag
+ * Protocol: -P udp (default) or -P tcp
  *
  * Usage:
- *   Server: vlan_tag_switch.exe -s [-p <port>] [-a <ip>] [-v <vlan_id>]
- *   Client: vlan_tag_switch.exe -c <server_ip:port> [-v <vlan_id>] [-i]
- *   Test:   vlan_tag_switch.exe -c <server_ip:port> -t [-b <bw>] [-d <sec>] [-l <len>] [-v <vlan_id>]
+ *   Server: vlan_tag_switch.exe -s [-p <port>] [-a <ip>] [-v <vlan_id>] [-P udp|tcp]
+ *   Client: vlan_tag_switch.exe -c <server_ip:port> [-v <vlan_id>] [-i] [-P udp|tcp]
+ *   Test:   vlan_tag_switch.exe -c <server_ip:port> -t [-b <bw>] [-d <sec>] [-l <len>] [-v <vlan_id>] [-P udp|tcp]
  *
  * Build (MinGW):
  *   gcc -Wall -O2 -IC:\WpdPack\Include -o vlan_tag_switch.exe vlan_tag_switch.c ^
@@ -38,6 +39,7 @@
 #define VLAN_ETH_HDR_LEN (ETH_HDR_LEN + VLAN_TAG_LEN)
 #define IP_HDR_LEN       20
 #define UDP_HDR_LEN      8
+#define TCP_HDR_LEN      20
 #define MAX_PACKET_LEN   2048
 #define DEFAULT_PORT     9999
 #define ARP_TIMEOUT_MS   3000
@@ -50,6 +52,11 @@
 
 /* IP Protocol */
 #define IP_PROTOCOL_UDP  17
+#define IP_PROTOCOL_TCP  6
+
+/* Transport protocol selection */
+#define PROTO_UDP  0
+#define PROTO_TCP  1
 
 /* ARP */
 #define ARP_HW_TYPE_ETH  0x0001
@@ -76,6 +83,7 @@ static int       g_running    = 1;
 static run_mode_t g_mode      = MODE_NONE;
 static int       g_interactive = 1;
 static int       g_test_mode  = 0;
+static int       g_protocol   = PROTO_UDP;  /* PROTO_UDP or PROTO_TCP */
 
 /* Test parameters */
 static double   g_target_bps  = 0;
@@ -118,6 +126,35 @@ typedef struct {
     uint16_t length;
     uint16_t checksum;
 } udp_header_t;
+
+typedef struct {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq;
+    uint32_t ack;
+    uint8_t  data_off;  /* high 4 bits = data offset in 32-bit words */
+    uint8_t  flags;     /* bit0=FIN,bit1=SYN,bit2=RST,bit3=PSH,bit4=ACK,bit5=URG */
+    uint16_t window;
+    uint16_t checksum;
+    uint16_t urgent;
+} tcp_header_t;
+
+/* TCP flag bits */
+#define TCP_FIN  0x01
+#define TCP_SYN  0x02
+#define TCP_RST  0x04
+#define TCP_PSH  0x08
+#define TCP_ACK  0x10
+#define TCP_URG  0x20
+
+/* Pseudo header for TCP checksum */
+typedef struct {
+    uint8_t  src_ip[4];
+    uint8_t  dst_ip[4];
+    uint8_t  zero;
+    uint8_t  protocol;
+    uint16_t tcp_length;
+} tcp_pseudo_header_t;
 
 typedef struct {
     uint16_t hw_type;
@@ -211,6 +248,40 @@ static uint16_t calc_checksum(const uint16_t *data, int len)
     while (sum >> 16) {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
+    return (uint16_t)(~sum);
+}
+
+/*
+ * TCP checksum with pseudo-header
+ */
+static uint16_t calc_tcp_checksum(const uint8_t *src_ip, const uint8_t *dst_ip,
+                                  const tcp_header_t *tcp, int tcp_len)
+{
+    tcp_pseudo_header_t pseudo;
+    memset(&pseudo, 0, sizeof(pseudo));
+    memcpy(pseudo.src_ip, src_ip, 4);
+    memcpy(pseudo.dst_ip, dst_ip, 4);
+    pseudo.protocol = IP_PROTOCOL_TCP;
+    pseudo.tcp_length = htons((uint16_t)tcp_len);
+
+    /* Sum pseudo header */
+    uint32_t sum = 0;
+    const uint16_t *p = (const uint16_t *)&pseudo;
+    for (int i = 0; i < (int)sizeof(tcp_pseudo_header_t) / 2; i++)
+        sum += p[i];
+
+    /* Sum TCP header + payload */
+    p = (const uint16_t *)tcp;
+    while (tcp_len > 1) {
+        sum += *p++;
+        tcp_len -= 2;
+    }
+    if (tcp_len == 1)
+        sum += *(const uint8_t *)p;
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+
     return (uint16_t)(~sum);
 }
 
@@ -362,17 +433,21 @@ static int arp_resolve(pcap_t *handle, const uint8_t *src_mac, const uint8_t *sr
  *=====================================================================*/
 
 /*
- * Build packet (optional VLAN tag)
+ * Build packet (optional VLAN tag, UDP or TCP)
  * vlan_id=0 means no VLAN tag
+ * protocol: PROTO_UDP or PROTO_TCP
  */
 static int build_packet(uint8_t *frame, int frame_size,
                         const uint8_t *dst_mac, const uint8_t *src_mac,
                         uint16_t vlan_id, uint8_t pcp,
                         const uint8_t *src_ip, const uint8_t *dst_ip,
                         uint16_t src_port, uint16_t dst_port,
-                        const uint8_t *payload, int payload_len)
+                        const uint8_t *payload, int payload_len,
+                        int protocol, uint32_t tcp_seq, uint32_t tcp_ack, uint8_t tcp_flags)
 {
-    int hdr_len = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN;
+    int transport_hdr_len = (protocol == PROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
+    int ip_protocol = (protocol == PROTO_TCP) ? IP_PROTOCOL_TCP : IP_PROTOCOL_UDP;
+    int hdr_len = ETH_HDR_LEN + IP_HDR_LEN + transport_hdr_len;
     uint16_t eth_type = ETHERTYPE_IP;
 
     if (vlan_id > 0) {
@@ -384,9 +459,9 @@ static int build_packet(uint8_t *frame, int frame_size,
     if (total_len > frame_size) return -1;
 
     eth_header_t  *eth   = (eth_header_t *)frame;
-    ip_header_t   *ip    = (ip_header_t *)(frame + hdr_len - IP_HDR_LEN - UDP_HDR_LEN);
-    udp_header_t  *udp   = (udp_header_t *)(frame + hdr_len - UDP_HDR_LEN);
+    ip_header_t   *ip    = (ip_header_t *)(frame + hdr_len - IP_HDR_LEN - transport_hdr_len);
     uint8_t       *data  = frame + hdr_len;
+    int ip_payload_len   = transport_hdr_len + payload_len;
 
     /* Ethernet header */
     memcpy(eth->dst_mac, dst_mac, 6);
@@ -403,33 +478,56 @@ static int build_packet(uint8_t *frame, int frame_size,
     /* IP header */
     ip->ver_ihl    = 0x45;
     ip->tos        = 0;
-    ip->total_len  = htons(IP_HDR_LEN + UDP_HDR_LEN + payload_len);
+    ip->total_len  = htons(IP_HDR_LEN + ip_payload_len);
     ip->id         = htons((uint16_t)GetTickCount());
     ip->flags_frag = 0;
     ip->ttl        = 64;
-    ip->protocol   = IP_PROTOCOL_UDP;
+    ip->protocol   = (uint8_t)ip_protocol;
     ip->checksum   = 0;
     memcpy(ip->src_ip, src_ip, 4);
     memcpy(ip->dst_ip, dst_ip, 4);
     ip->checksum   = calc_checksum((uint16_t *)ip, IP_HDR_LEN);
 
-    /* UDP header */
-    udp->src_port  = htons(src_port);
-    udp->dst_port  = htons(dst_port);
-    udp->length    = htons(UDP_HDR_LEN + payload_len);
-    udp->checksum  = 0;
+    if (protocol == PROTO_TCP) {
+        /* TCP header */
+        tcp_header_t *tcp = (tcp_header_t *)(frame + hdr_len - transport_hdr_len);
+        tcp->src_port  = htons(src_port);
+        tcp->dst_port  = htons(dst_port);
+        tcp->seq       = htonl(tcp_seq);
+        tcp->ack       = htonl(tcp_ack);
+        tcp->data_off  = (5 << 4);  /* 5 words = 20 bytes, no options */
+        tcp->flags     = tcp_flags;
+        tcp->window    = htons(65535);
+        tcp->checksum  = 0;
+        tcp->urgent    = 0;
 
-    /* Payload */
-    if (payload_len > 0)
-        memcpy(data, payload, payload_len);
+        /* Copy payload after TCP header */
+        if (payload_len > 0)
+            memcpy(data, payload, payload_len);
+
+        /* TCP checksum (requires pseudo-header) */
+        tcp->checksum = calc_tcp_checksum(src_ip, dst_ip, tcp, TCP_HDR_LEN + payload_len);
+    } else {
+        /* UDP header */
+        udp_header_t *udp = (udp_header_t *)(frame + hdr_len - transport_hdr_len);
+        udp->src_port  = htons(src_port);
+        udp->dst_port  = htons(dst_port);
+        udp->length    = htons(UDP_HDR_LEN + payload_len);
+        udp->checksum  = 0;
+
+        /* Payload */
+        if (payload_len > 0)
+            memcpy(data, payload, payload_len);
+    }
 
     return total_len;
 }
 
 /*
- * Parse received packet (auto-detect VLAN tag)
+ * Parse received packet (auto-detect VLAN tag, UDP or TCP)
  * Returns payload length
  * out_is_vlan: if not NULL, returns whether packet has VLAN
+ * out_is_tcp: if not NULL, returns whether packet is TCP (1) or UDP (0)
  */
 static int parse_packet(const uint8_t *pkt, int pkt_len,
                         uint8_t *out_src_mac, uint8_t *out_dst_mac,
@@ -438,9 +536,11 @@ static int parse_packet(const uint8_t *pkt, int pkt_len,
                         uint16_t *out_src_port, uint16_t *out_dst_port,
                         uint8_t *out_payload, int max_payload_len,
                         uint16_t expected_dst_port,
-                        int *out_is_vlan)
+                        int *out_is_vlan,
+                        int *out_is_tcp)
 {
-    if (pkt_len < ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN)
+    int min_transport_len = (UDP_HDR_LEN < TCP_HDR_LEN) ? UDP_HDR_LEN : TCP_HDR_LEN;
+    if (pkt_len < ETH_HDR_LEN + IP_HDR_LEN + min_transport_len)
         return -1;
 
     const eth_header_t *eth = (const eth_header_t *)pkt;
@@ -451,13 +551,32 @@ static int parse_packet(const uint8_t *pkt, int pkt_len,
     if (ethertype == ETHERTYPE_VLAN) {
         vlan = 1;
         ip_offset = VLAN_ETH_HDR_LEN;
-        if (pkt_len < VLAN_ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN)
+        if (pkt_len < VLAN_ETH_HDR_LEN + IP_HDR_LEN + min_transport_len)
             return -1;
     }
 
-    const ip_header_t  *ip   = (const ip_header_t *)(pkt + ip_offset);
-    const udp_header_t *udp  = (const udp_header_t *)(pkt + ip_offset + IP_HDR_LEN);
-    const uint8_t      *data = pkt + ip_offset + IP_HDR_LEN + UDP_HDR_LEN;
+    const ip_header_t *ip = (const ip_header_t *)(pkt + ip_offset);
+
+    /* Check IP protocol - accept both UDP and TCP */
+    int is_tcp;
+    int transport_hdr_len;
+    if (ip->protocol == IP_PROTOCOL_TCP) {
+        is_tcp = 1;
+        transport_hdr_len = TCP_HDR_LEN;
+    } else if (ip->protocol == IP_PROTOCOL_UDP) {
+        is_tcp = 0;
+        transport_hdr_len = UDP_HDR_LEN;
+    } else {
+        return -3;  /* unsupported protocol */
+    }
+
+    if (out_is_tcp) *out_is_tcp = is_tcp;
+
+    if (pkt_len < ip_offset + IP_HDR_LEN + transport_hdr_len)
+        return -1;
+
+    const uint8_t *transport = pkt + ip_offset + IP_HDR_LEN;
+    const uint8_t *data = transport + transport_hdr_len;
 
     /* Extract MAC */
     if (out_dst_mac) memcpy(out_dst_mac, eth->dst_mac, 6);
@@ -475,17 +594,15 @@ static int parse_packet(const uint8_t *pkt, int pkt_len,
         if (out_pcp)     *out_pcp = (tci >> VLAN_PCP_SHIFT) & 0x07;
     }
 
-    /* Check IP protocol */
-    if (ip->protocol != IP_PROTOCOL_UDP)
-        return -3;
-
     /* Extract IP */
     if (out_src_ip) memcpy(out_src_ip, ip->src_ip, 4);
     if (out_dst_ip) memcpy(out_dst_ip, ip->dst_ip, 4);
 
-    /* Check UDP port */
-    uint16_t dst_port = ntohs(udp->dst_port);
-    uint16_t src_port = ntohs(udp->src_port);
+    /* Extract ports (same offset for UDP and TCP) */
+    uint16_t dst_port = ntohs(((const uint16_t *)transport)[1]);
+    uint16_t src_port = ntohs(((const uint16_t *)transport)[0]);
+
+    /* Filter by expected port (only if not in mixed mode) */
     if (expected_dst_port != 0 && dst_port != expected_dst_port)
         return -4;
 
@@ -493,8 +610,19 @@ static int parse_packet(const uint8_t *pkt, int pkt_len,
     if (out_dst_port) *out_dst_port = dst_port;
 
     /* Extract payload */
-    int udp_len = ntohs(udp->length);
-    int payload_len = udp_len - UDP_HDR_LEN;
+    int payload_len;
+    if (is_tcp) {
+        /* TCP: data offset is in 32-bit words */
+        const tcp_header_t *tcp_hdr = (const tcp_header_t *)transport;
+        int tcp_hdr_len = (tcp_hdr->data_off >> 4) * 4;
+        if (tcp_hdr_len < TCP_HDR_LEN) tcp_hdr_len = TCP_HDR_LEN;
+        payload_len = ntohs(ip->total_len) - IP_HDR_LEN - tcp_hdr_len;
+    } else {
+        /* UDP: length field includes header */
+        uint16_t udp_len = ntohs(((const udp_header_t *)transport)->length);
+        payload_len = udp_len - UDP_HDR_LEN;
+    }
+
     if (payload_len < 0) payload_len = 0;
     if (payload_len > max_payload_len) payload_len = max_payload_len;
 
@@ -519,7 +647,10 @@ static int send_packet(const uint8_t *dst_mac,
                                  g_vlan_id, g_pcp,
                                  src_ip, dst_ip,
                                  src_port, dst_port,
-                                 payload, payload_len);
+                                 payload, payload_len,
+                                 g_protocol,
+                                 0, 0,  /* tcp_seq, tcp_ack - managed per-connection */
+                                 TCP_PSH | TCP_ACK);
     if (frame_len < 0) return -1;
 
     if (pcap_sendpacket(g_handle, frame, frame_len) != 0) {
@@ -533,8 +664,10 @@ static int recv_packet(uint16_t expected_dst_port,
                        uint16_t *out_src_port,
                        uint8_t *out_payload, int max_payload_len,
                        int timeout_ms,
-                       int *out_is_vlan)
+                       int *out_is_vlan,
+                       int *out_is_tcp)
 {
+    int min_hdr = (UDP_HDR_LEN < TCP_HDR_LEN) ? UDP_HDR_LEN : TCP_HDR_LEN;
     LARGE_INTEGER freq, start;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
@@ -548,14 +681,15 @@ static int recv_packet(uint16_t expected_dst_port,
         struct pcap_pkthdr *hdr;
         const u_char *pkt;
         int ret = pcap_next_ex(g_handle, &hdr, &pkt);
-        if (ret == 1 && hdr->caplen >= ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN) {
+        if (ret == 1 && hdr->caplen >= (size_t)(ETH_HDR_LEN + IP_HDR_LEN + min_hdr)) {
             return parse_packet(pkt, hdr->caplen,
                                out_src_mac, NULL, NULL, NULL,
                                out_src_ip, NULL,
                                out_src_port, NULL,
                                out_payload, max_payload_len,
                                expected_dst_port,
-                               out_is_vlan);
+                               out_is_vlan,
+                               out_is_tcp);
         } else if (ret == 0) {
             Sleep(10);
         } else if (ret < 0) {
@@ -584,9 +718,10 @@ static void server_interactive_loop(void)
     printf(" ---\n");
     printf("--- Type messages to send to client (quit to exit) ---\n\n");
 
+    int is_tcp = 0;
     while (g_running) {
         int payload_len = recv_packet(g_listen_port, src_mac, src_ip, &src_port,
-                                      payload, sizeof(payload) - 1, 100, &is_vlan);
+                                      payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp);
         if (payload_len > 0) {
             payload[payload_len] = '\0';
             SYSTEMTIME st;
@@ -670,9 +805,10 @@ static void client_interactive_loop(void)
     printf(" ---\n");
     printf("--- Type messages to send to server (quit to exit) ---\n\n");
 
+    int is_tcp = 0;
     while (g_running) {
         int payload_len = recv_packet(g_listen_port, src_mac, src_ip, &src_port,
-                                      payload, sizeof(payload) - 1, 100, &is_vlan);
+                                      payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp);
         if (payload_len > 0) {
             payload[payload_len] = '\0';
             SYSTEMTIME st;
@@ -900,9 +1036,10 @@ static void iperf_server_test(void)
     }
     printf("========================================\n\n");
 
+    int is_tcp = 0;
     while (g_running) {
         int payload_len = recv_packet(g_listen_port, src_mac, src_ip, &src_port,
-                                      payload, sizeof(payload) - 1, 100, &is_vlan);
+                                      payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp);
         if (payload_len >= (int)sizeof(test_header_t)) {
             test_header_t *test_hdr = (test_header_t *)payload;
             uint32_t seq = ntohl(test_hdr->seq);
@@ -993,23 +1130,25 @@ static void usage(const char *prog)
     printf("  -p <port>       Listen port (default %d)\n", DEFAULT_PORT);
     printf("  -a <ip>         Listen IP (default: auto detect)\n");
     printf("  -v <vlan_id>    VLAN ID (optional, no VLAN tag if not specified)\n");
+    printf("  -P <protocol>   Transport protocol: udp (default) or tcp\n");
     printf("  -b <bandwidth>  Target bandwidth (e.g. 100M, 1G, default unlimited)\n");
     printf("  -d <duration>   Test duration in seconds (default 10)\n");
     printf("  -l <length>     Packet payload size (default 1400)\n");
     printf("\n");
     printf("Description:\n");
-    printf("  L3 (IP+UDP) packets with optional L2 VLAN tag\n");
+    printf("  L3 (IP+UDP or IP+TCP) packets with optional L2 VLAN tag\n");
     printf("  Without -v: no VLAN tag, with -v <vlan_id>: add VLAN tag\n");
     printf("  Peer MAC resolved automatically via ARP\n");
     printf("\n");
     printf("Examples:\n");
     printf("  %s -l\n", prog);
-    printf("  %s -s -p 9999                # without VLAN\n", prog);
+    printf("  %s -s -p 9999                # UDP, without VLAN\n", prog);
+    printf("  %s -s -p 9999 -P tcp         # TCP mode\n", prog);
     printf("  %s -s -p 9999 -v 100         # with VLAN 100\n", prog);
-    printf("  %s -c 192.168.1.100:9999     # without VLAN\n", prog);
-    printf("  %s -c 192.168.1.100:9999 -v 100   # with VLAN 100\n", prog);
+    printf("  %s -c 192.168.1.100:9999     # UDP, without VLAN\n", prog);
+    printf("  %s -c 192.168.1.100:9999 -P tcp -v 100  # TCP with VLAN 100\n", prog);
     printf("  %s -c 192.168.1.100:9999 -t -b 100M -d 30\n", prog);
-    printf("  %s -c 192.168.1.100:9999 -t -b 1G -v 100\n", prog);
+    printf("  %s -c 192.168.1.100:9999 -t -b 1G -P tcp -v 100\n", prog);
 }
 
 static double parse_bandwidth(const char *str)
@@ -1092,6 +1231,16 @@ int main(int argc, char *argv[])
             g_vlan_id = (uint16_t)atoi(argv[arg_idx + 1]);
             if (g_vlan_id < 1 || g_vlan_id > 4094) {
                 fprintf(stderr, "Error: VLAN ID must be between 1-4094\n");
+                return 1;
+            }
+            arg_idx += 2;
+        } else if (strcmp(argv[arg_idx], "-P") == 0 && arg_idx + 1 < argc) {
+            if (strcmp(argv[arg_idx + 1], "tcp") == 0 || strcmp(argv[arg_idx + 1], "TCP") == 0) {
+                g_protocol = PROTO_TCP;
+            } else if (strcmp(argv[arg_idx + 1], "udp") == 0 || strcmp(argv[arg_idx + 1], "UDP") == 0) {
+                g_protocol = PROTO_UDP;
+            } else {
+                fprintf(stderr, "Error: Unknown protocol '%s' (use 'udp' or 'tcp')\n", argv[arg_idx + 1]);
                 return 1;
             }
             arg_idx += 2;
@@ -1193,6 +1342,7 @@ int main(int argc, char *argv[])
     } else {
         printf(" VLAN      : None (no VLAN tag)\n");
     }
+    printf(" Protocol  : %s\n", g_protocol == PROTO_TCP ? "TCP" : "UDP");
     printf(" Port      : %u\n", g_listen_port);
     if (g_test_mode) {
         printf(" Test Mode : iperf\n");
