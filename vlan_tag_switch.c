@@ -542,7 +542,8 @@ static int parse_packet(const uint8_t *pkt, int pkt_len,
                         uint8_t *out_payload, int max_payload_len,
                         uint16_t expected_dst_port,
                         int *out_is_vlan,
-                        int *out_is_tcp)
+                        int *out_is_tcp,
+                        int expected_protocol)
 {
     int min_transport_len = (UDP_HDR_LEN < TCP_HDR_LEN) ? UDP_HDR_LEN : TCP_HDR_LEN;
     if (pkt_len < ETH_HDR_LEN + IP_HDR_LEN + min_transport_len)
@@ -574,6 +575,12 @@ static int parse_packet(const uint8_t *pkt, int pkt_len,
     } else {
         return -3;  /* unsupported protocol */
     }
+
+    /* Protocol filter: if expected_protocol is set, skip non-matching packets */
+    if (expected_protocol == PROTO_TCP && !is_tcp)
+        return -100;  /* wrong protocol, keep listening */
+    if (expected_protocol == PROTO_UDP && is_tcp)
+        return -100;  /* wrong protocol, keep listening */
 
     if (out_is_tcp) *out_is_tcp = is_tcp;
 
@@ -670,7 +677,8 @@ static int recv_packet(uint16_t expected_dst_port,
                        uint8_t *out_payload, int max_payload_len,
                        int timeout_ms,
                        int *out_is_vlan,
-                       int *out_is_tcp)
+                       int *out_is_tcp,
+                       int expected_protocol)
 {
     int min_hdr = (UDP_HDR_LEN < TCP_HDR_LEN) ? UDP_HDR_LEN : TCP_HDR_LEN;
     LARGE_INTEGER freq, start;
@@ -687,14 +695,18 @@ static int recv_packet(uint16_t expected_dst_port,
         const u_char *pkt;
         int ret = pcap_next_ex(g_handle, &hdr, &pkt);
         if (ret == 1 && hdr->caplen >= (size_t)(ETH_HDR_LEN + IP_HDR_LEN + min_hdr)) {
-            return parse_packet(pkt, hdr->caplen,
-                               out_src_mac, NULL, NULL, NULL,
-                               out_src_ip, NULL,
-                               out_src_port, NULL,
-                               out_payload, max_payload_len,
-                               expected_dst_port,
-                               out_is_vlan,
-                               out_is_tcp);
+            int result = parse_packet(pkt, hdr->caplen,
+                                     out_src_mac, NULL, NULL, NULL,
+                                     out_src_ip, NULL,
+                                     out_src_port, NULL,
+                                     out_payload, max_payload_len,
+                                     expected_dst_port,
+                                     out_is_vlan,
+                                     out_is_tcp,
+                                     expected_protocol);
+            if (result == -100)
+                continue;  /* wrong protocol, keep listening */
+            return result;
         } else if (ret == 0) {
             Sleep(10);
         } else if (ret < 0) {
@@ -726,7 +738,7 @@ static void server_interactive_loop(void)
     int is_tcp = 0;
     while (g_running) {
         int payload_len = recv_packet(g_listen_port, src_mac, src_ip, &src_port,
-                                      payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp);
+                                      payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp, g_protocol);
         if (payload_len > 0) {
             payload[payload_len] = '\0';
             SYSTEMTIME st;
@@ -813,7 +825,7 @@ static void client_interactive_loop(void)
     int is_tcp = 0;
     while (g_running) {
         int payload_len = recv_packet(g_listen_port, src_mac, src_ip, &src_port,
-                                      payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp);
+                                      payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp, g_protocol);
         if (payload_len > 0) {
             payload[payload_len] = '\0';
             SYSTEMTIME st;
@@ -1045,7 +1057,7 @@ static void iperf_server_test(void)
     int is_tcp = 0;
     while (g_running) {
         int payload_len = recv_packet(g_listen_port, src_mac, src_ip, &src_port,
-                                      payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp);
+                                      payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp, g_protocol);
         if (payload_len >= (int)sizeof(test_header_t)) {
             test_header_t *test_hdr = (test_header_t *)payload;
             uint32_t seq = ntohl(test_hdr->seq);
