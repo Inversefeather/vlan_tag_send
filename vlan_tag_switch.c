@@ -468,11 +468,16 @@ static int build_packet(uint8_t *frame, int frame_size,
     memcpy(eth->src_mac, src_mac, 6);
     eth->ethertype = htons(eth_type);
 
-    /* VLAN tag (optional) */
+    /* VLAN tag (optional) - 802.1Q format:
+     * [Dst MAC(6)] [Src MAC(6)] [TPID=0x8100(2)] [TCI(2)] [EtherType=0x0800(2)] [IP]...
+     * The TPID is already written as eth->ethertype above */
     if (vlan_id > 0) {
-        vlan_tag_t *vlan = (vlan_tag_t *)(frame + ETH_HDR_LEN);
-        vlan->tpid = htons(ETHERTYPE_VLAN);
-        vlan->tci  = htons(((uint16_t)(pcp & 0x07) << VLAN_PCP_SHIFT) | (vlan_id & VLAN_VID_MASK));
+        /* TCI at offset 14-15 (after TPID) */
+        uint16_t *tci = (uint16_t *)(frame + ETH_HDR_LEN);
+        *tci = htons(((uint16_t)(pcp & 0x07) << VLAN_PCP_SHIFT) | (vlan_id & VLAN_VID_MASK));
+        /* Inner EtherType at offset 16-17 (after TCI) */
+        uint16_t *inner_type = (uint16_t *)(frame + ETH_HDR_LEN + 2);
+        *inner_type = htons(ETHERTYPE_IP);
     }
 
     /* IP header */
@@ -588,8 +593,8 @@ static int parse_packet(const uint8_t *pkt, int pkt_len,
     if (out_is_vlan) *out_is_vlan = vlan;
 
     if (vlan) {
-        const vlan_tag_t *vlan_tag = (const vlan_tag_t *)(pkt + ETH_HDR_LEN);
-        uint16_t tci = ntohs(vlan_tag->tci);
+        /* TCI is at offset 14-15 (after TPID at 12-13) */
+        uint16_t tci = ntohs(*(const uint16_t *)(pkt + ETH_HDR_LEN));
         if (out_vlan_id) *out_vlan_id = tci & VLAN_VID_MASK;
         if (out_pcp)     *out_pcp = (tci >> VLAN_PCP_SHIFT) & 0x07;
     }
@@ -916,7 +921,8 @@ static void iperf_client_test(void)
 
     double interval_us = 0;
     if (g_target_bps > 0) {
-        int hdr_len = get_frame_header_len() + IP_HDR_LEN + UDP_HDR_LEN;
+        int transport_hdr_len = (g_protocol == PROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
+        int hdr_len = get_frame_header_len() + IP_HDR_LEN + transport_hdr_len;
         double bits_per_pkt = (double)(g_pkt_size + hdr_len) * 8;
         interval_us = (bits_per_pkt / g_target_bps) * 1e6;
     }
@@ -1056,10 +1062,11 @@ static void iperf_server_test(void)
                 last_seq = seq;
             }
 
+            int transport_hdr_len = (g_protocol == PROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
             int hdr_len = get_frame_header_len();
-            total_bytes += payload_len + hdr_len + IP_HDR_LEN + UDP_HDR_LEN;
+            total_bytes += payload_len + hdr_len + IP_HDR_LEN + transport_hdr_len;
             total_pkts++;
-            interval_bytes += payload_len + hdr_len + IP_HDR_LEN + UDP_HDR_LEN;
+            interval_bytes += payload_len + hdr_len + IP_HDR_LEN + transport_hdr_len;
             interval_pkts++;
         }
 
