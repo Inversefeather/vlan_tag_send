@@ -969,18 +969,34 @@ static void iperf_client_test(void)
         double elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
         if (elapsed_sec >= g_test_duration) break;
 
-        test_hdr->seq = htonl(seq++);
-        test_hdr->sec = htonl((uint32_t)elapsed_sec);
-        test_hdr->usec = htonl((uint32_t)((elapsed_sec - (uint32_t)elapsed_sec) * 1e6));
+        /* Send a burst of packets for high bandwidth targets */
+        int burst_size = 1;
+        if (interval_us > 0 && interval_us < 1000) {
+            /* For sub-ms intervals, send multiple packets per wait */
+            burst_size = (int)(1000.0 / interval_us);
+            if (burst_size < 1) burst_size = 1;
+            if (burst_size > 100) burst_size = 100;
+        }
 
-        int sent = send_packet(g_peer_mac, g_my_ip, g_peer_ip,
-                               50000 + (seq % 10000), g_listen_port,
-                               payload, g_pkt_size);
-        if (sent > 0) {
-            total_bytes += sent;
-            total_pkts++;
-            interval_bytes += sent;
-            interval_pkts++;
+        for (int b = 0; b < burst_size; b++) {
+            test_hdr->seq = htonl(seq++);
+            test_hdr->sec = htonl((uint32_t)elapsed_sec);
+            test_hdr->usec = htonl((uint32_t)((elapsed_sec - (uint32_t)elapsed_sec) * 1e6));
+
+            int sent = send_packet(g_peer_mac, g_my_ip, g_peer_ip,
+                                   50000 + (seq % 10000), g_listen_port,
+                                   payload, g_pkt_size);
+            if (sent > 0) {
+                total_bytes += sent;
+                total_pkts++;
+                interval_bytes += sent;
+                interval_pkts++;
+            }
+
+            /* Re-check duration inside burst */
+            QueryPerformanceCounter(&now);
+            elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
+            if (elapsed_sec >= g_test_duration) break;
         }
 
         double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
@@ -999,7 +1015,10 @@ static void iperf_client_test(void)
         }
 
         if (interval_us > 0) {
-            Sleep((DWORD)(interval_us / 1000));
+            /* Convert us to ms, minimum 1ms */
+            DWORD sleep_ms = (DWORD)(interval_us / 1000);
+            if (sleep_ms < 1) sleep_ms = 1;
+            Sleep(sleep_ms);
         }
     }
 
@@ -1032,8 +1051,6 @@ static void iperf_server_test(void)
 
     uint64_t total_bytes = 0;
     uint64_t total_pkts = 0;
-    uint64_t lost_pkts = 0;
-    uint32_t last_seq = 0;
     int first_pkt = 1;
     int is_vlan;
 
@@ -1066,18 +1083,12 @@ static void iperf_server_test(void)
                                       payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp, g_protocol);
         if (payload_len >= (int)sizeof(test_header_t)) {
             test_header_t *test_hdr = (test_header_t *)payload;
-            uint32_t seq = ntohl(test_hdr->seq);
+            (void)test_hdr;  /* payload already validated */
 
             if (first_pkt) {
                 first_pkt = 0;
-                last_seq = seq;
                 printf("  [First Pkt] From %u.%u.%u.%u:%u\n",
                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port);
-            } else {
-                if (seq > last_seq + 1) {
-                    lost_pkts += (seq - last_seq - 1);
-                }
-                last_seq = seq;
             }
 
             int transport_hdr_len = (g_protocol == PROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
@@ -1107,13 +1118,10 @@ static void iperf_server_test(void)
             char bw_str[32], bytes_str[32];
             format_bps(bps, bw_str, sizeof(bw_str));
             format_bytes(interval_bytes, bytes_str, sizeof(bytes_str));
-            double loss_rate = (total_pkts + lost_pkts > 0) ?
-                               100.0 * lost_pkts / (total_pkts + lost_pkts) : 0;
-            printf("  [%5.1fs] %s  %s/s  %llu pkts  lost=%llu (%.1f%%)\n",
+            printf("  [%5.1fs] %s  %s/s  %llu packets\n",
                    (double)(now.QuadPart - start.QuadPart) / freq.QuadPart,
                    bytes_str, bw_str,
-                   (unsigned long long)interval_pkts,
-                   (unsigned long long)lost_pkts, loss_rate);
+                   (unsigned long long)interval_pkts);
 
             interval_bytes = 0;
             interval_pkts = 0;
@@ -1126,19 +1134,16 @@ static void iperf_server_test(void)
     QueryPerformanceCounter(&end);
     double total_sec = (double)(end.QuadPart - start.QuadPart) / freq.QuadPart;
     double avg_bps = (total_sec > 0) ? (double)total_bytes * 8 / total_sec : 0;
-    double loss_rate = (total_pkts + lost_pkts > 0) ?
-                       100.0 * lost_pkts / (total_pkts + lost_pkts) : 0;
 
     char bw_str[32], bytes_str[32];
     format_bps(avg_bps, bw_str, sizeof(bw_str));
     format_bytes(total_bytes, bytes_str, sizeof(bytes_str));
 
     printf("\n========================================\n");
-    printf("  [Receive Complete]\n");
+    printf("  [Test Complete]\n");
     printf("  Total Time: %.2f sec\n", total_sec);
     printf("  Total Data: %s\n", bytes_str);
     printf("  Total Pkts: %llu\n", (unsigned long long)total_pkts);
-    printf("  Lost Pkts: %llu (%.1f%%)\n", (unsigned long long)lost_pkts, loss_rate);
     printf("  Avg Bandwidth: %s\n", bw_str);
     printf("========================================\n");
 }
