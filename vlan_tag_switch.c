@@ -1269,7 +1269,7 @@ int main(int argc, char *argv[])
             usage(argv[0]);
             return 0;
         } else if (strcmp(argv[arg_idx], "-v") == 0 || strcmp(argv[arg_idx], "--version") == 0) {
-            printf("vlan_tag_switch version 1.0.0\n");
+            printf("vlan_tag_switch version 1.0.15\n");
             return 0;
         } else if (strcmp(argv[arg_idx], "--list") == 0) {
             if (pcap_findalldevs(&alldevs, errbuf) == -1) {
