@@ -81,15 +81,18 @@ static uint16_t g_listen_port = 0;
 static pcap_t   *g_handle     = NULL;
 static int       g_running    = 1;
 static run_mode_t g_mode      = MODE_NONE;
-static int       g_interactive = 0;
-static int       g_test_mode  = 0;
+static int       g_interactive = 0;  /* print payload details (interactive mode) */
 static int       g_protocol   = PROTO_UDP;  /* PROTO_UDP or PROTO_TCP */
 
-/* Test parameters */
-static double   g_target_bps  = 0;
-static int      g_test_duration = 10;
-static int      g_silence_timeout = 3;  /* server auto-stop after N seconds of silence */
-static int      g_pkt_size    = 1400;
+/* Test parameters (iperf-compatible) */
+static double   g_target_bps  = 0;      /* -b: target bandwidth */
+static int      g_test_duration = 10;   /* -t: transmit time in seconds */
+static uint64_t g_bytes_to_send = 0;    /* -n: bytes to transmit (0 = use -t) */
+static int      g_report_interval = 1;  /* -i: bandwidth report interval */
+static int      g_silence_timeout = 3;  /* -T: server auto-stop after N seconds of silence */
+static int      g_pkt_size    = 1400;   /* -l: packet/buffer length */
+static int      g_parallel    = 1;      /* -P: parallel streams */
+static char     g_bind_host[64] = {0};  /* -B: bind to interface */
 
 /*=======================================================================
  * Data structures (packed)
@@ -204,25 +207,6 @@ static int parse_ip(const char *str, uint8_t *ip)
         return 0;
     }
     return -1;
-}
-
-static int parse_ip_port(const char *str, uint8_t *ip, uint16_t *port)
-{
-    char ip_str[64];
-    int p;
-    const char *colon = strrchr(str, ':');
-    if (!colon) return -1;
-
-    int ip_len = (int)(colon - str);
-    if (ip_len >= (int)sizeof(ip_str)) return -1;
-    strncpy(ip_str, str, ip_len);
-    ip_str[ip_len] = '\0';
-    p = atoi(colon + 1);
-
-    if (p < 1 || p > 65535) return -1;
-    if (parse_ip(ip_str, ip) < 0) return -1;
-    *port = (uint16_t)p;
-    return 0;
 }
 
 static void print_mac(const char *label, const uint8_t *mac)
@@ -955,7 +939,11 @@ static void iperf_client_test(void)
     } else {
         printf("  Target BW: Unlimited (as fast as possible)\n");
     }
-    printf("  Duration: %d sec\n", g_test_duration);
+    if (g_bytes_to_send > 0) {
+        printf("  Bytes to Send: %llu\n", (unsigned long long)g_bytes_to_send);
+    } else {
+        printf("  Duration: %d sec\n", g_test_duration);
+    }
     printf("========================================\n\n");
 
     uint64_t interval_bytes = 0;
@@ -967,7 +955,13 @@ static void iperf_client_test(void)
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         double elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
-        if (elapsed_sec >= g_test_duration) break;
+
+        /* Stop by time (-t) or by byte count (-n) */
+        if (g_bytes_to_send > 0) {
+            if (total_bytes >= g_bytes_to_send) break;
+        } else {
+            if (elapsed_sec >= g_test_duration) break;
+        }
 
         /* Send a burst of packets for high bandwidth targets */
         int burst_size = 1;
@@ -993,14 +987,18 @@ static void iperf_client_test(void)
                 interval_pkts++;
             }
 
-            /* Re-check duration inside burst */
+            /* Re-check stop condition inside burst */
             QueryPerformanceCounter(&now);
             elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
-            if (elapsed_sec >= g_test_duration) break;
+            if (g_bytes_to_send > 0) {
+                if (total_bytes >= g_bytes_to_send) break;
+            } else {
+                if (elapsed_sec >= g_test_duration) break;
+            }
         }
 
         double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
-        if (interval_sec >= 1.0) {
+        if (interval_sec >= g_report_interval) {
             double bps = (double)interval_bytes * 8 / interval_sec;
             char bw_str[32], bytes_str[32];
             format_bps(bps, bw_str, sizeof(bw_str));
@@ -1110,7 +1108,7 @@ static void iperf_server_test(void)
         }
 
         double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
-        if (interval_sec >= 1.0) {
+        if (interval_sec >= g_report_interval) {
             /* Only print if we received packets this interval */
             if (interval_pkts > 0) {
                 double bps = (double)interval_bytes * 8 / interval_sec;
@@ -1155,44 +1153,57 @@ static void iperf_server_test(void)
 static void usage(const char *prog)
 {
     printf("VLAN Tag Switch Test Tool (WinPcap/Npcap)\n");
+    printf("L3 (IP+UDP/TCP) packet tester with optional VLAN tag\n");
     printf("\n");
     printf("Usage:\n");
-    printf("  %s -l                                List available adapters\n", prog);
-    printf("  %s -s [-p <port>] [-a <ip>] [-v <vlan_id>]           Server mode\n", prog);
-    printf("  %s -c <server_ip:port> [-v <vlan_id>] [-i]            Client mode\n", prog);
-    printf("  %s -c <server_ip:port> -t [-b <bw>] [-d <sec>] [-l <len>] [-v <vlan_id>]  iperf test\n", prog);
+    printf("  %s --list                            List available adapters\n", prog);
+    printf("  %s -s [options]                      Server mode\n", prog);
+    printf("  %s -c <host> [options]               Client mode\n", prog);
     printf("\n");
-    printf("Options:\n");
+    printf("Common options:\n");
     printf("  -h              Show this help message\n");
-    printf("  -l              List available adapters\n");
-    printf("  -s              Server mode\n");
-    printf("  -c <ip:port>    Client mode, specify server address\n");
-    printf("  -i              Interactive mode (default)\n");
-    printf("  -t              iperf bandwidth test mode\n");
-    printf("  -p <port>       Listen port (default %d)\n", DEFAULT_PORT);
-    printf("  -a <ip>         Listen IP (default: auto detect)\n");
-    printf("  -v <vlan_id>    VLAN ID (optional, no VLAN tag if not specified)\n");
-    printf("  -P <protocol>   Transport protocol: udp (default) or tcp\n");
-    printf("  -b <bandwidth>  Target bandwidth (e.g. 100M, 1G, default unlimited)\n");
-    printf("  -d <duration>   Client test duration in seconds (default 10)\n");
-    printf("  -T <timeout>    Server auto-stop silence timeout in seconds (default 3)\n");
-    printf("  -l <length>     Packet payload size (default 1400)\n");
+    printf("  -v              Show version information\n");
+    printf("  --list          List available adapters\n");
+    printf("\n");
+    printf("Server or Client:\n");
+    printf("  -p, --port      #         server port to listen on/connect to (default %d)\n", DEFAULT_PORT);
+    printf("  -B, --bind      <host>    bind to a specific interface\n");
+    printf("  -V, --vlan      #         VLAN ID (1-4094, optional)\n");
+    printf("  -u, --udp                 use UDP (default)\n");
+    printf("  --tcp                     use TCP\n");
+    printf("\n");
+    printf("Client specific:\n");
+    printf("  -c, --client    <host>    run in client mode, connecting to <host>\n");
+    printf("  -b, --bandwidth #[KMG]    target bandwidth in bits/sec (0 for unlimited)\n");
+    printf("  -t, --time      #         time in seconds to transmit for (default 10)\n");
+    printf("  -n, --bytes     #[KMG]    number of bytes to transmit (instead of -t)\n");
+    printf("  -l, --len       #[KMG]    length of buffer to read or write (default 1400)\n");
+    printf("  -P, --parallel  #         number of parallel client streams (default 1)\n");
+    printf("  -i, --interval  #         seconds between bandwidth reports (default 1)\n");
+    printf("      --interactive         interactive mode (print payload details)\n");
+    printf("\n");
+    printf("Server specific:\n");
+    printf("  -s, --server              run in server mode\n");
+    printf("  -T, --timeout     #       auto-stop after N seconds of silence (default 3)\n");
+    printf("\n");
+    printf("[KMG] indicates options that support a K/M/G suffix for kilo-, mega-, or giga-\n");
     printf("\n");
     printf("Description:\n");
     printf("  L3 (IP+UDP or IP+TCP) packets with optional L2 VLAN tag\n");
-    printf("  Without -v: no VLAN tag, with -v <vlan_id>: add VLAN tag\n");
+    printf("  Without -V: no VLAN tag, with -V <vlan_id>: add VLAN tag\n");
     printf("  Peer MAC resolved automatically via ARP\n");
     printf("\n");
     printf("Examples:\n");
-    printf("  %s -l\n", prog);
-    printf("  %s -s -p 9999                # UDP, without VLAN\n", prog);
-    printf("  %s -s -p 9999 -P tcp         # TCP mode\n", prog);
-    printf("  %s -s -p 9999 -v 100         # with VLAN 100\n", prog);
-    printf("  %s -c 192.168.1.100:9999     # UDP, without VLAN\n", prog);
-    printf("  %s -c 192.168.1.100:9999 -P tcp -v 100  # TCP with VLAN 100\n", prog);
-    printf("  %s -c 192.168.1.100:9999 -t -b 100M -d 30\n", prog);
-    printf("  %s -c 192.168.1.100:9999 -t -b 1G -P tcp -v 100\n", prog);
-    printf("  %s -s -p 9999 -t -T 30            # server waits 30s before auto-stop\n", prog);
+    printf("  %s --list\n", prog);
+    printf("  %s -s -p 9999                    # UDP server, no VLAN\n", prog);
+    printf("  %s -s -p 9999 --tcp              # TCP server\n", prog);
+    printf("  %s -s -p 9999 -V 100             # with VLAN 100\n", prog);
+    printf("  %s -c 192.168.1.100 -p 9999       # UDP client, no VLAN\n", prog);
+    printf("  %s -c 192.168.1.100 -p 9999 --tcp -V 100\n", prog);
+    printf("  %s -c 192.168.1.100 -p 9999 -b 100M -t 30\n", prog);
+    printf("  %s -c 192.168.1.100 -p 9999 -b 1G --tcp -V 100\n", prog);
+    printf("  %s -s -p 9999 -T 30              # server waits 30s before auto-stop\n", prog);
+    printf("  %s -c 192.168.1.100 -p 9999 --interactive  # interactive mode\n", prog);
 }
 
 static double parse_bandwidth(const char *str)
@@ -1212,6 +1223,23 @@ static double parse_bandwidth(const char *str)
         return value;
 }
 
+static uint64_t parse_bytes(const char *str)
+{
+    double value;
+    char unit[16] = {0};
+
+    if (sscanf(str, "%lf%15s", &value, unit) < 1) return 0;
+
+    if (unit[0] == 'G' || unit[0] == 'g')
+        return (uint64_t)(value * 1073741824.0);  /* 1024^3 */
+    else if (unit[0] == 'M' || unit[0] == 'm')
+        return (uint64_t)(value * 1048576.0);     /* 1024^2 */
+    else if (unit[0] == 'K' || unit[0] == 'k')
+        return (uint64_t)(value * 1024.0);
+    else
+        return (uint64_t)value;
+}
+
 /*=======================================================================
  * Main function
  *=====================================================================*/
@@ -1222,7 +1250,6 @@ int main(int argc, char *argv[])
     char errbuf[PCAP_ERRBUF_SIZE];
     char *adapter_name = NULL;
     char *server_ip_port = NULL;
-    char *listen_ip_str = NULL;
 
     if (argc < 2 || (argc == 2 && (strcmp(argv[1], "-l") == 0 ||
                                     strcmp(argv[1], "--list") == 0))) {
@@ -1242,67 +1269,92 @@ int main(int argc, char *argv[])
         if (strcmp(argv[arg_idx], "-h") == 0 || strcmp(argv[arg_idx], "--help") == 0) {
             usage(argv[0]);
             return 0;
-        } else if (strcmp(argv[arg_idx], "-s") == 0) {
+        } else if (strcmp(argv[arg_idx], "-v") == 0 || strcmp(argv[arg_idx], "--version") == 0) {
+            printf("vlan_tag_switch version 1.0.0\n");
+            return 0;
+        } else if (strcmp(argv[arg_idx], "--list") == 0) {
+            if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+                fprintf(stderr, "Error: pcap_findalldevs: %s\n", errbuf);
+                return 1;
+            }
+            printf("Available adapters:\n");
+            list_adapters(alldevs);
+            pcap_freealldevs(alldevs);
+            return 0;
+        } else if (strcmp(argv[arg_idx], "-s") == 0 || strcmp(argv[arg_idx], "--server") == 0) {
             g_mode = MODE_SERVER;
             arg_idx++;
-        } else if (strcmp(argv[arg_idx], "-c") == 0) {
+        } else if (strcmp(argv[arg_idx], "-c") == 0 || strcmp(argv[arg_idx], "--client") == 0) {
             g_mode = MODE_CLIENT;
             arg_idx++;
             if (arg_idx < argc && argv[arg_idx][0] != '-') {
                 server_ip_port = argv[arg_idx];
                 arg_idx++;
             }
-        } else if (strcmp(argv[arg_idx], "-i") == 0) {
-            g_interactive = 1;
-            arg_idx++;
-        } else if (strcmp(argv[arg_idx], "-t") == 0) {
-            g_test_mode = 1;
-            g_interactive = 0;
-            arg_idx++;
-        } else if (strcmp(argv[arg_idx], "-p") == 0 && arg_idx + 1 < argc) {
-            g_listen_port = (uint16_t)atoi(argv[arg_idx + 1]);
-            arg_idx += 2;
-        } else if (strcmp(argv[arg_idx], "-a") == 0 && arg_idx + 1 < argc) {
-            listen_ip_str = argv[arg_idx + 1];
-            arg_idx += 2;
-        } else if (strcmp(argv[arg_idx], "-v") == 0 && arg_idx + 1 < argc) {
-            g_vlan_id = (uint16_t)atoi(argv[arg_idx + 1]);
-            if (g_vlan_id < 1 || g_vlan_id > 4094) {
-                fprintf(stderr, "Error: VLAN ID must be between 1-4094\n");
-                return 1;
-            }
-            arg_idx += 2;
-        } else if (strcmp(argv[arg_idx], "-P") == 0 && arg_idx + 1 < argc) {
-            if (strcmp(argv[arg_idx + 1], "tcp") == 0 || strcmp(argv[arg_idx + 1], "TCP") == 0) {
-                g_protocol = PROTO_TCP;
-            } else if (strcmp(argv[arg_idx + 1], "udp") == 0 || strcmp(argv[arg_idx + 1], "UDP") == 0) {
-                g_protocol = PROTO_UDP;
+        } else if (strcmp(argv[arg_idx], "-p") == 0 || strcmp(argv[arg_idx], "--port") == 0) {
+            if (arg_idx + 1 < argc) {
+                g_listen_port = (uint16_t)atoi(argv[arg_idx + 1]);
+                arg_idx += 2;
             } else {
-                fprintf(stderr, "Error: Unknown protocol '%s' (use 'udp' or 'tcp')\n", argv[arg_idx + 1]);
+                fprintf(stderr, "Error: -p requires a port number\n");
                 return 1;
             }
-            arg_idx += 2;
-        } else if (strcmp(argv[arg_idx], "-b") == 0 && arg_idx + 1 < argc) {
-            g_target_bps = parse_bandwidth(argv[arg_idx + 1]);
-            arg_idx += 2;
-        } else if (strcmp(argv[arg_idx], "-d") == 0 && arg_idx + 1 < argc) {
-            g_test_duration = atoi(argv[arg_idx + 1]);
-            if (g_test_duration < 1 || g_test_duration > 3600) {
-                fprintf(stderr, "Error: duration must be between 1-3600\n");
+        } else if (strcmp(argv[arg_idx], "-B") == 0 || strcmp(argv[arg_idx], "--bind") == 0) {
+            if (arg_idx + 1 < argc) {
+                strncpy(g_bind_host, argv[arg_idx + 1], sizeof(g_bind_host) - 1);
+                arg_idx += 2;
+            } else {
+                fprintf(stderr, "Error: -B requires a host address\n");
                 return 1;
             }
-            arg_idx += 2;
-        } else if (strcmp(argv[arg_idx], "-T") == 0 && arg_idx + 1 < argc) {
-            g_silence_timeout = atoi(argv[arg_idx + 1]);
-            if (g_silence_timeout < 1 || g_silence_timeout > 300) {
-                fprintf(stderr, "Error: timeout must be between 1-300\n");
+        } else if (strcmp(argv[arg_idx], "-V") == 0 || strcmp(argv[arg_idx], "--vlan") == 0) {
+            if (arg_idx + 1 < argc) {
+                g_vlan_id = (uint16_t)atoi(argv[arg_idx + 1]);
+                if (g_vlan_id < 1 || g_vlan_id > 4094) {
+                    fprintf(stderr, "Error: VLAN ID must be between 1-4094\n");
+                    return 1;
+                }
+                arg_idx += 2;
+            } else {
+                fprintf(stderr, "Error: -V requires a VLAN ID\n");
                 return 1;
             }
-            arg_idx += 2;
-        } else if (strcmp(argv[arg_idx], "-l") == 0 || strcmp(argv[arg_idx], "--list") == 0) {
-            /* Check if next arg is a number (packet length) or not (list adapters) */
-            if (arg_idx + 1 < argc && argv[arg_idx + 1][0] != '-' && atoi(argv[arg_idx + 1]) > 0) {
-                /* -l <length>: set packet payload size */
+        } else if (strcmp(argv[arg_idx], "-u") == 0 || strcmp(argv[arg_idx], "--udp") == 0) {
+            g_protocol = PROTO_UDP;
+            arg_idx++;
+        } else if (strcmp(argv[arg_idx], "--tcp") == 0) {
+            g_protocol = PROTO_TCP;
+            arg_idx++;
+        } else if (strcmp(argv[arg_idx], "-b") == 0 || strcmp(argv[arg_idx], "--bandwidth") == 0) {
+            if (arg_idx + 1 < argc) {
+                g_target_bps = parse_bandwidth(argv[arg_idx + 1]);
+                arg_idx += 2;
+            } else {
+                fprintf(stderr, "Error: -b requires a bandwidth value\n");
+                return 1;
+            }
+        } else if (strcmp(argv[arg_idx], "-t") == 0 || strcmp(argv[arg_idx], "--time") == 0) {
+            if (arg_idx + 1 < argc) {
+                g_test_duration = atoi(argv[arg_idx + 1]);
+                if (g_test_duration < 1 || g_test_duration > 3600) {
+                    fprintf(stderr, "Error: time must be between 1-3600\n");
+                    return 1;
+                }
+                arg_idx += 2;
+            } else {
+                fprintf(stderr, "Error: -t requires a time value\n");
+                return 1;
+            }
+        } else if (strcmp(argv[arg_idx], "-n") == 0 || strcmp(argv[arg_idx], "--bytes") == 0) {
+            if (arg_idx + 1 < argc) {
+                g_bytes_to_send = parse_bytes(argv[arg_idx + 1]);
+                arg_idx += 2;
+            } else {
+                fprintf(stderr, "Error: -n requires a byte count\n");
+                return 1;
+            }
+        } else if (strcmp(argv[arg_idx], "-l") == 0 || strcmp(argv[arg_idx], "--len") == 0) {
+            if (arg_idx + 1 < argc) {
                 g_pkt_size = atoi(argv[arg_idx + 1]);
                 if (g_pkt_size < 64 || g_pkt_size > 1472) {
                     fprintf(stderr, "Error: length must be between 64-1472\n");
@@ -1310,16 +1362,48 @@ int main(int argc, char *argv[])
                 }
                 arg_idx += 2;
             } else {
-                /* -l or --list: list adapters */
-                if (pcap_findalldevs(&alldevs, errbuf) == -1) {
-                    fprintf(stderr, "Error: pcap_findalldevs: %s\n", errbuf);
+                fprintf(stderr, "Error: -l requires a length value\n");
+                return 1;
+            }
+        } else if (strcmp(argv[arg_idx], "-P") == 0 || strcmp(argv[arg_idx], "--parallel") == 0) {
+            if (arg_idx + 1 < argc) {
+                g_parallel = atoi(argv[arg_idx + 1]);
+                if (g_parallel < 1 || g_parallel > 100) {
+                    fprintf(stderr, "Error: parallel must be between 1-100\n");
                     return 1;
                 }
-                printf("Available adapters:\n");
-                list_adapters(alldevs);
-                pcap_freealldevs(alldevs);
-                return 0;
+                arg_idx += 2;
+            } else {
+                fprintf(stderr, "Error: -P requires a parallel count\n");
+                return 1;
             }
+        } else if (strcmp(argv[arg_idx], "-i") == 0 || strcmp(argv[arg_idx], "--interval") == 0) {
+            if (arg_idx + 1 < argc) {
+                g_report_interval = atoi(argv[arg_idx + 1]);
+                if (g_report_interval < 1 || g_report_interval > 60) {
+                    fprintf(stderr, "Error: interval must be between 1-60\n");
+                    return 1;
+                }
+                arg_idx += 2;
+            } else {
+                fprintf(stderr, "Error: -i requires an interval value\n");
+                return 1;
+            }
+        } else if (strcmp(argv[arg_idx], "-T") == 0 || strcmp(argv[arg_idx], "--timeout") == 0) {
+            if (arg_idx + 1 < argc) {
+                g_silence_timeout = atoi(argv[arg_idx + 1]);
+                if (g_silence_timeout < 1 || g_silence_timeout > 300) {
+                    fprintf(stderr, "Error: timeout must be between 1-300\n");
+                    return 1;
+                }
+                arg_idx += 2;
+            } else {
+                fprintf(stderr, "Error: -T requires a timeout value\n");
+                return 1;
+            }
+        } else if (strcmp(argv[arg_idx], "--interactive") == 0) {
+            g_interactive = 1;
+            arg_idx++;
         } else if (adapter_name == NULL && argv[arg_idx][0] != '-') {
             adapter_name = argv[arg_idx];
             arg_idx++;
@@ -1330,8 +1414,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    (void)listen_ip_str; /* reserved for future bind-IP feature */
-
     if (g_mode == MODE_NONE) {
         fprintf(stderr, "Error: Please use -s (server) or -c (client) to specify mode\n\n");
         usage(argv[0]);
@@ -1339,7 +1421,7 @@ int main(int argc, char *argv[])
     }
 
     if (g_mode == MODE_CLIENT && server_ip_port == NULL) {
-        fprintf(stderr, "Error: Client mode requires server IP:port\n\n");
+        fprintf(stderr, "Error: Client mode requires server host address\n\n");
         usage(argv[0]);
         return 1;
     }
@@ -1403,29 +1485,43 @@ int main(int argc, char *argv[])
     }
     printf(" Protocol  : %s\n", g_protocol == PROTO_TCP ? "TCP" : "UDP");
     printf(" Port      : %u\n", g_listen_port);
-    if (g_test_mode) {
-        printf(" Test Mode : iperf\n");
-        if (g_target_bps > 0) {
-            char bw_str[32];
-            format_bps(g_target_bps, bw_str, sizeof(bw_str));
-            printf(" Target BW : %s\n", bw_str);
-        } else {
-            printf(" Target BW : Unlimited\n");
-        }
-        printf(" Duration  : %d sec\n", g_test_duration);
-        printf(" Timeout   : %d sec (server auto-stop)\n", g_silence_timeout);
-        printf(" Pkt Size  : %d bytes\n", g_pkt_size);
+    if (g_target_bps > 0) {
+        char bw_str[32];
+        format_bps(g_target_bps, bw_str, sizeof(bw_str));
+        printf(" Target BW : %s\n", bw_str);
     }
+    printf(" Duration  : %d sec\n", g_test_duration);
+    printf(" Timeout   : %d sec (server auto-stop)\n", g_silence_timeout);
+    printf(" Pkt Size  : %d bytes\n", g_pkt_size);
+    printf(" Interval  : %d sec (report interval)\n", g_report_interval);
     printf("========================================\n");
 
     if (g_mode == MODE_CLIENT) {
-        if (parse_ip_port(server_ip_port, g_peer_ip, &g_listen_port) < 0) {
-            fprintf(stderr, "Error: Invalid IP:port format: %s\n", server_ip_port);
+        /* Parse server address: support both "ip:port" and "ip" (port from -p) */
+        char ip_str[64];
+        strncpy(ip_str, server_ip_port, sizeof(ip_str) - 1);
+        ip_str[sizeof(ip_str) - 1] = '\0';
+
+        /* Check if port is embedded in the address (contains ':') */
+        char *colon = strrchr(ip_str, ':');
+        if (colon) {
+            /* Format: ip:port - extract both */
+            *colon = '\0';
+            int port = atoi(colon + 1);
+            if (port > 0 && port <= 65535) {
+                g_listen_port = (uint16_t)port;
+            }
+        }
+        /* else: port comes from -p flag (already set) */
+
+        if (parse_ip(ip_str, g_peer_ip) < 0) {
+            fprintf(stderr, "Error: Invalid IP address: %s\n", ip_str);
             pcap_close(g_handle);
             pcap_freealldevs(alldevs);
             return 1;
         }
         print_ip("Peer IP", g_peer_ip);
+        printf(" Peer Port : %u\n", g_listen_port);
         printf("========================================\n");
 
         printf("\n[ARP] Resolving peer MAC address...\n");
@@ -1440,14 +1536,7 @@ int main(int argc, char *argv[])
         printf("========================================\n");
     }
 
-    if (g_test_mode) {
-        /* iperf test mode: only print bandwidth */
-        if (g_mode == MODE_CLIENT) {
-            iperf_client_test();
-        } else {
-            iperf_server_test();
-        }
-    } else if (g_interactive) {
+    if (g_interactive) {
         /* Interactive mode: print packet payload details */
         if (g_mode == MODE_SERVER) {
             server_interactive_loop();
@@ -1455,9 +1544,9 @@ int main(int argc, char *argv[])
             client_interactive_loop();
         }
     } else {
-        /* Default: client=interactive, server=bandwidth-only */
+        /* Default / iperf test mode: only print bandwidth */
         if (g_mode == MODE_CLIENT) {
-            client_interactive_loop();
+            iperf_client_test();
         } else {
             iperf_server_test();
         }
