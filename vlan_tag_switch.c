@@ -82,7 +82,7 @@ static pcap_t   *g_handle     = NULL;
 static int       g_running    = 1;
 static run_mode_t g_mode      = MODE_NONE;
 static int       g_interactive = 0;  /* print payload details (interactive mode) */
-static int       g_protocol   = PROTO_UDP;  /* PROTO_UDP or PROTO_TCP */
+static int       g_protocol   = PROTO_TCP;  /* PROTO_UDP or PROTO_TCP (default TCP) */
 
 /* Test parameters (iperf-compatible) */
 static double   g_target_bps  = 0;      /* -b: target bandwidth */
@@ -1169,8 +1169,7 @@ static void usage(const char *prog)
     printf("  -p, --port      #         server port to listen on/connect to (default %d)\n", DEFAULT_PORT);
     printf("  -B, --bind      <host>    bind to a specific interface\n");
     printf("  -V, --vlan      #         VLAN ID (1-4094, optional)\n");
-    printf("  -u, --udp                 use UDP (default)\n");
-    printf("  --tcp                     use TCP\n");
+    printf("  -u, --udp                 use UDP (default is TCP)\n");
     printf("\n");
     printf("Client specific:\n");
     printf("  -c, --client    <host>    run in client mode, connecting to <host>\n");
@@ -1195,13 +1194,13 @@ static void usage(const char *prog)
     printf("\n");
     printf("Examples:\n");
     printf("  %s --list\n", prog);
-    printf("  %s -s -p 9999                    # UDP server, no VLAN\n", prog);
-    printf("  %s -s -p 9999 --tcp              # TCP server\n", prog);
+    printf("  %s -s -p 9999                    # TCP server, no VLAN\n", prog);
+    printf("  %s -s -p 9999 -u                 # UDP server\n", prog);
     printf("  %s -s -p 9999 -V 100             # with VLAN 100\n", prog);
-    printf("  %s -c 192.168.1.100 -p 9999       # UDP client, no VLAN\n", prog);
-    printf("  %s -c 192.168.1.100 -p 9999 --tcp -V 100\n", prog);
+    printf("  %s -c 192.168.1.100 -p 9999       # TCP client, no VLAN\n", prog);
+    printf("  %s -c 192.168.1.100 -p 9999 -u -V 100\n", prog);
     printf("  %s -c 192.168.1.100 -p 9999 -b 100M -t 30\n", prog);
-    printf("  %s -c 192.168.1.100 -p 9999 -b 1G --tcp -V 100\n", prog);
+    printf("  %s -c 192.168.1.100 -p 9999 -b 1G -u -V 100\n", prog);
     printf("  %s -s -p 9999 -T 30              # server waits 30s before auto-stop\n", prog);
     printf("  %s -c 192.168.1.100 -p 9999 --interactive  # interactive mode\n", prog);
 }
@@ -1321,9 +1320,6 @@ int main(int argc, char *argv[])
             }
         } else if (strcmp(argv[arg_idx], "-u") == 0 || strcmp(argv[arg_idx], "--udp") == 0) {
             g_protocol = PROTO_UDP;
-            arg_idx++;
-        } else if (strcmp(argv[arg_idx], "--tcp") == 0) {
-            g_protocol = PROTO_TCP;
             arg_idx++;
         } else if (strcmp(argv[arg_idx], "-b") == 0 || strcmp(argv[arg_idx], "--bandwidth") == 0) {
             if (arg_idx + 1 < argc) {
