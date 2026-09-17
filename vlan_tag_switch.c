@@ -1239,16 +1239,7 @@ int main(int argc, char *argv[])
 
     int arg_idx = 1;
     while (arg_idx < argc) {
-        if (strcmp(argv[arg_idx], "-l") == 0 || strcmp(argv[arg_idx], "--list") == 0) {
-            if (pcap_findalldevs(&alldevs, errbuf) == -1) {
-                fprintf(stderr, "Error: pcap_findalldevs: %s\n", errbuf);
-                return 1;
-            }
-            printf("Available adapters:\n");
-            list_adapters(alldevs);
-            pcap_freealldevs(alldevs);
-            return 0;
-        } else if (strcmp(argv[arg_idx], "-h") == 0 || strcmp(argv[arg_idx], "--help") == 0) {
+        if (strcmp(argv[arg_idx], "-h") == 0 || strcmp(argv[arg_idx], "--help") == 0) {
             usage(argv[0]);
             return 0;
         } else if (strcmp(argv[arg_idx], "-s") == 0) {
@@ -1308,13 +1299,27 @@ int main(int argc, char *argv[])
                 return 1;
             }
             arg_idx += 2;
-        } else if (strcmp(argv[arg_idx], "-l") == 0 && arg_idx + 1 < argc) {
-            g_pkt_size = atoi(argv[arg_idx + 1]);
-            if (g_pkt_size < 64 || g_pkt_size > 1472) {
-                fprintf(stderr, "Error: length must be between 64-1472\n");
-                return 1;
+        } else if (strcmp(argv[arg_idx], "-l") == 0 || strcmp(argv[arg_idx], "--list") == 0) {
+            /* Check if next arg is a number (packet length) or not (list adapters) */
+            if (arg_idx + 1 < argc && argv[arg_idx + 1][0] != '-' && atoi(argv[arg_idx + 1]) > 0) {
+                /* -l <length>: set packet payload size */
+                g_pkt_size = atoi(argv[arg_idx + 1]);
+                if (g_pkt_size < 64 || g_pkt_size > 1472) {
+                    fprintf(stderr, "Error: length must be between 64-1472\n");
+                    return 1;
+                }
+                arg_idx += 2;
+            } else {
+                /* -l or --list: list adapters */
+                if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+                    fprintf(stderr, "Error: pcap_findalldevs: %s\n", errbuf);
+                    return 1;
+                }
+                printf("Available adapters:\n");
+                list_adapters(alldevs);
+                pcap_freealldevs(alldevs);
+                return 0;
             }
-            arg_idx += 2;
         } else if (adapter_name == NULL && argv[arg_idx][0] != '-') {
             adapter_name = argv[arg_idx];
             arg_idx++;
