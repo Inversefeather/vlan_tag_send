@@ -943,30 +943,26 @@ static void iperf_client_test(void)
         interval_us = (bits_per_pkt / g_target_bps) * 1e6;
     }
 
-    printf("\n--- iperf Client Test ---\n");
-    printf("  Target: %u.%u.%u.%u:%u\n", g_peer_ip[0], g_peer_ip[1], g_peer_ip[2], g_peer_ip[3], g_listen_port);
+    printf("\nConnecting to host %u.%u.%u.%u, port %u\n",
+           g_peer_ip[0], g_peer_ip[1], g_peer_ip[2], g_peer_ip[3], g_listen_port);
     if (g_vlan_id > 0) {
-        printf("  VLAN: %u\n", g_vlan_id);
-    } else {
-        printf("  VLAN: None\n");
+        printf("VLAN: %u, ", g_vlan_id);
     }
-    printf("  Pkt Size: %d bytes (payload)\n", g_pkt_size);
+    printf("Protocol: %s, Pkt Size: %d bytes\n",
+           g_protocol == PROTO_TCP ? "TCP" : "UDP", g_pkt_size);
     if (g_target_bps > 0) {
         char bw_str[32];
         format_bps(g_target_bps, bw_str, sizeof(bw_str));
-        printf("  Target BW: %s\n", bw_str);
-    } else {
-        printf("  Target BW: Unlimited (as fast as possible)\n");
+        printf("Target BW: %s\n", bw_str);
     }
     if (g_bytes_to_send > 0) {
-        printf("  Bytes to Send: %llu\n", (unsigned long long)g_bytes_to_send);
+        printf("Bytes to Send: %llu\n", (unsigned long long)g_bytes_to_send);
     } else {
-        printf("  Duration: %d sec\n", g_test_duration);
+        printf("Duration: %d sec\n", g_test_duration);
     }
-    printf("========================================\n\n");
+    printf("\n[ ID] Interval           Transfer     Bandwidth\n");
 
     uint64_t interval_bytes = 0;
-    uint64_t interval_pkts = 0;
     LARGE_INTEGER interval_start;
     QueryPerformanceCounter(&interval_start);
 
@@ -1003,7 +999,6 @@ static void iperf_client_test(void)
                 total_bytes += sent;
                 total_pkts++;
                 interval_bytes += sent;
-                interval_pkts++;
             }
 
             /* Re-check stop condition inside burst */
@@ -1019,14 +1014,15 @@ static void iperf_client_test(void)
         double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
         if (interval_sec >= g_report_interval) {
             double bps = (double)interval_bytes * 8 / interval_sec;
+            double interval_start_sec = (double)(interval_start.QuadPart - start.QuadPart) / freq.QuadPart;
             char bw_str[32], bytes_str[32];
             format_bps(bps, bw_str, sizeof(bw_str));
             format_bytes(interval_bytes, bytes_str, sizeof(bytes_str));
-            printf("  [%5.1fs] %s  %s/s  %llu packets\n",
-                   elapsed_sec, bytes_str, bw_str, (unsigned long long)interval_pkts);
+            /* iperf format: [ID]  start-end  sec  Transfer  Bandwidth */
+            printf("[  1] %5.2f-%5.2f sec  %s  %s/sec\n",
+                   interval_start_sec, elapsed_sec, bytes_str, bw_str);
 
             interval_bytes = 0;
-            interval_pkts = 0;
             interval_start = now;
             fflush(stdout);
         }
@@ -1048,13 +1044,11 @@ static void iperf_client_test(void)
     format_bps(avg_bps, bw_str, sizeof(bw_str));
     format_bytes(total_bytes, bytes_str, sizeof(bytes_str));
 
-    printf("\n========================================\n");
-    printf("  [Test Complete]\n");
-    printf("  Total Time: %.2f sec\n", total_sec);
-    printf("  Total Data: %s\n", bytes_str);
-    printf("  Total Pkts: %llu\n", (unsigned long long)total_pkts);
-    printf("  Avg Bandwidth: %s\n", bw_str);
-    printf("========================================\n");
+    /* Print final summary in iperf format */
+    printf("[  1]  0.00-%5.2f sec  %s  %s/sec\n",
+           total_sec, bytes_str, bw_str);
+    printf("\nTest complete. Sent %llu packets in %.2f seconds.\n",
+           (unsigned long long)total_pkts, total_sec);
 }
 
 /*
