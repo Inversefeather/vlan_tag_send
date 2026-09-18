@@ -918,6 +918,39 @@ static int get_frame_header_len(void)
 }
 
 /*
+ * High-resolution sleep using busy-wait for sub-ms precision.
+ * Windows Sleep() has ~10ms resolution which is too coarse for packet pacing.
+ */
+static void spin_wait_us(double us)
+{
+    if (us <= 0) return;
+    LARGE_INTEGER freq, start;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    LONGLONG target = (LONGLONG)(us * freq.QuadPart / 1e6);
+    LARGE_INTEGER now;
+    do {
+        QueryPerformanceCounter(&now);
+    } while ((now.QuadPart - start.QuadPart) < target);
+}
+
+/*
+ * Hybrid sleep: Sleep() for long waits, spin-wait for final sub-ms precision.
+ */
+static void highres_sleep_ms(double ms)
+{
+    if (ms <= 0) return;
+    if (ms > 2.0) {
+        /* Sleep for most of the time, then spin-wait the remainder */
+        DWORD sleep_ms = (DWORD)(ms - 1.0);
+        Sleep(sleep_ms);
+        ms -= sleep_ms;
+    }
+    /* Spin-wait for remaining sub-ms time */
+    spin_wait_us(ms * 1000.0);
+}
+
+/*
  * iperf client test
  */
 static void iperf_client_test(void)
@@ -1051,10 +1084,9 @@ static void iperf_client_test(void)
         }
 
         if (interval_us > 0) {
-            /* Convert us to ms, minimum 1ms */
-            DWORD sleep_ms = (DWORD)(interval_us / 1000);
-            if (sleep_ms < 1) sleep_ms = 1;
-            Sleep(sleep_ms);
+            /* Use high-resolution sleep for accurate packet pacing */
+            double sleep_ms = interval_us / 1000.0;
+            highres_sleep_ms(sleep_ms);
         }
     }
 
