@@ -1076,6 +1076,10 @@ static void iperf_server_test(void)
     QueryPerformanceCounter(&last_pkt_time);
     int silence_timeout_ms = g_silence_timeout * 1000;
 
+    LARGE_INTEGER new_flow_start;  /* for detecting new flows after a gap */
+    QueryPerformanceCounter(&new_flow_start);
+    int gap_sec = g_report_interval * 2;  /* gap > 2x interval = new flow */
+
     while (g_running) {
         int payload_len = recv_packet(g_listen_port, src_mac, src_ip, &src_port,
                                       payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp, g_protocol);
@@ -1083,8 +1087,24 @@ static void iperf_server_test(void)
             test_header_t *test_hdr = (test_header_t *)payload;
             (void)test_hdr;  /* payload already validated */
 
+            /* Detect new flow: if gap since last packet > threshold, reset timing */
+            LARGE_INTEGER pkt_time;
+            QueryPerformanceCounter(&pkt_time);
+            double gap_since_last = (double)(pkt_time.QuadPart - last_pkt_time.QuadPart) / freq.QuadPart;
+
             if (first_pkt) {
                 first_pkt = 0;
+                /* First packet ever - reset start time */
+                start = pkt_time;
+                new_flow_start = pkt_time;
+                interval_start = pkt_time;
+            } else if (gap_since_last > gap_sec) {
+                /* New flow detected after a gap - reset timing */
+                start = pkt_time;
+                new_flow_start = pkt_time;
+                interval_start = pkt_time;
+                interval_bytes = 0;
+                interval_pkts = 0;
             }
 
             int transport_hdr_len = (g_protocol == PROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
