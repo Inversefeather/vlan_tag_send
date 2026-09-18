@@ -190,10 +190,14 @@ typedef struct {
     uint8_t  src_mac[6];
     uint8_t  src_ip[4];
     uint16_t src_port;
-    uint64_t total_bytes;       /* total bytes received from this client */
-    uint64_t total_pkts;        /* total packets received */
-    uint64_t interval_bytes;    /* bytes in current report interval */
-    uint64_t interval_pkts;     /* packets in current report interval */
+    /* Receiver stats (from client) */
+    uint64_t recv_bytes;        /* total bytes received from this client */
+    uint64_t recv_pkts;         /* total packets received */
+    uint64_t interval_recv;     /* bytes received in current report interval */
+    /* Sender stats (to client) */
+    uint64_t send_bytes;        /* total bytes sent to this client */
+    uint64_t send_pkts;         /* total packets sent */
+    uint64_t interval_send;     /* bytes sent in current report interval */
     LARGE_INTEGER first_pkt;    /* timestamp of first packet */
     LARGE_INTEGER last_pkt;     /* timestamp of last packet */
     LARGE_INTEGER interval_start; /* start of current report interval */
@@ -929,8 +933,10 @@ static void iperf_client_test(void)
     }
 
     uint32_t seq = 0;
-    uint64_t total_bytes = 0;
-    uint64_t total_pkts = 0;
+    uint64_t send_bytes = 0;
+    uint64_t send_pkts = 0;
+    uint64_t recv_bytes = 0;
+    uint64_t recv_pkts = 0;
     LARGE_INTEGER freq, start;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
@@ -962,9 +968,14 @@ static void iperf_client_test(void)
     }
     printf("\n[ ID] Interval           Transfer     Bandwidth\n");
 
-    uint64_t interval_bytes = 0;
+    uint64_t interval_send = 0;
     LARGE_INTEGER interval_start;
     QueryPerformanceCounter(&interval_start);
+
+    uint8_t recv_mac[6], recv_ip[4];
+    uint16_t recv_port;
+    uint8_t recv_payload[MAX_PACKET_LEN];
+    int is_vlan, is_tcp;
 
     while (g_running) {
         LARGE_INTEGER now;
@@ -973,7 +984,7 @@ static void iperf_client_test(void)
 
         /* Stop by time (-t) or by byte count (-n) */
         if (g_bytes_to_send > 0) {
-            if (total_bytes >= g_bytes_to_send) break;
+            if (send_bytes >= g_bytes_to_send) break;
         } else {
             if (elapsed_sec >= g_test_duration) break;
         }
@@ -996,33 +1007,45 @@ static void iperf_client_test(void)
                                    50000 + (seq % 10000), g_listen_port,
                                    payload, g_pkt_size);
             if (sent > 0) {
-                total_bytes += sent;
-                total_pkts++;
-                interval_bytes += sent;
+                send_bytes += sent;
+                send_pkts++;
+                interval_send += sent;
             }
 
             /* Re-check stop condition inside burst */
             QueryPerformanceCounter(&now);
             elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
             if (g_bytes_to_send > 0) {
-                if (total_bytes >= g_bytes_to_send) break;
+                if (send_bytes >= g_bytes_to_send) break;
             } else {
                 if (elapsed_sec >= g_test_duration) break;
             }
         }
 
+        /* Check for received packets (non-blocking) */
+        int recv_len = recv_packet(g_listen_port, recv_mac, recv_ip, &recv_port,
+                                   recv_payload, sizeof(recv_payload) - 1, 10,
+                                   &is_vlan, &is_tcp, g_protocol);
+        if (recv_len > 0) {
+            int transport_hdr_len = (g_protocol == PROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
+            int hdr_len = get_frame_header_len();
+            recv_bytes += recv_len + hdr_len + IP_HDR_LEN + transport_hdr_len;
+            recv_pkts++;
+        }
+
+        QueryPerformanceCounter(&now);
         double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
         if (interval_sec >= g_report_interval) {
-            double bps = (double)interval_bytes * 8 / interval_sec;
+            double send_bps = (double)interval_send * 8 / interval_sec;
             double interval_start_sec = (double)(interval_start.QuadPart - start.QuadPart) / freq.QuadPart;
             char bw_str[32], bytes_str[32];
-            format_bps(bps, bw_str, sizeof(bw_str));
-            format_bytes(interval_bytes, bytes_str, sizeof(bytes_str));
+            format_bps(send_bps, bw_str, sizeof(bw_str));
+            format_bytes(interval_send, bytes_str, sizeof(bytes_str));
             /* iperf format: [ID]  start-end  sec  Transfer  Bandwidth */
             printf("[  1] %5.2f-%5.2f sec  %s  %s/sec\n",
                    interval_start_sec, elapsed_sec, bytes_str, bw_str);
 
-            interval_bytes = 0;
+            interval_send = 0;
             interval_start = now;
             fflush(stdout);
         }
@@ -1038,17 +1061,29 @@ static void iperf_client_test(void)
     LARGE_INTEGER end;
     QueryPerformanceCounter(&end);
     double total_sec = (double)(end.QuadPart - start.QuadPart) / freq.QuadPart;
-    double avg_bps = (total_sec > 0) ? (double)total_bytes * 8 / total_sec : 0;
+    double send_bps = (total_sec > 0) ? (double)send_bytes * 8 / total_sec : 0;
+    double recv_bps = (total_sec > 0) ? (double)recv_bytes * 8 / total_sec : 0;
 
-    char bw_str[32], bytes_str[32];
-    format_bps(avg_bps, bw_str, sizeof(bw_str));
-    format_bytes(total_bytes, bytes_str, sizeof(bytes_str));
+    char send_bw[32], send_bytes_str[32];
+    char recv_bw[32], recv_bytes_str[32];
+    format_bps(send_bps, send_bw, sizeof(send_bw));
+    format_bytes(send_bytes, send_bytes_str, sizeof(send_bytes_str));
+    format_bps(recv_bps, recv_bw, sizeof(recv_bw));
+    format_bytes(recv_bytes, recv_bytes_str, sizeof(recv_bytes_str));
 
     /* Print final summary in iperf format */
     printf("[  1]  0.00-%5.2f sec  %s  %s/sec\n",
-           total_sec, bytes_str, bw_str);
-    printf("\nTest complete. Sent %llu packets in %.2f seconds.\n",
-           (unsigned long long)total_pkts, total_sec);
+           total_sec, send_bytes_str, send_bw);
+
+    /* Print summary */
+    printf("\n- - - - - - - - - - - - - - - - - - - - - - - - -\n");
+    printf("[ ID] Interval           Transfer     Bandwidth\n");
+    printf("[  1]  0.00-%5.2f sec  %s  %s/sec                  sender\n",
+           total_sec, send_bytes_str, send_bw);
+    printf("[  1]  0.00-%5.2f sec  %s  %s/sec                  receiver\n",
+           total_sec, recv_bytes_str, recv_bw);
+    printf("\nTest complete. Sent %llu packets, Received %llu packets in %.2f seconds.\n",
+           (unsigned long long)send_pkts, (unsigned long long)recv_pkts, total_sec);
 }
 
 /*
@@ -1086,10 +1121,12 @@ static client_info_t *find_or_create_client(client_info_t clients[], int *client
     memcpy(c->src_mac, src_mac, 6);
     memcpy(c->src_ip, src_ip, 4);
     c->src_port = src_port;
-    c->total_bytes = 0;
-    c->total_pkts = 0;
-    c->interval_bytes = 0;
-    c->interval_pkts = 0;
+    c->recv_bytes = 0;
+    c->recv_pkts = 0;
+    c->interval_recv = 0;
+    c->send_bytes = 0;
+    c->send_pkts = 0;
+    c->interval_send = 0;
     c->first_pkt = now;
     c->last_pkt = now;
     c->interval_start = now;
@@ -1162,10 +1199,9 @@ static void iperf_server_test(void)
                 int hdr_len = get_frame_header_len();
                 uint64_t frame_len = payload_len + hdr_len + IP_HDR_LEN + transport_hdr_len;
 
-                c->total_bytes += frame_len;
-                c->total_pkts++;
-                c->interval_bytes += frame_len;
-                c->interval_pkts++;
+                c->recv_bytes += frame_len;
+                c->recv_pkts++;
+                c->interval_recv += frame_len;
                 c->last_pkt = now;
             }
         }
@@ -1179,16 +1215,22 @@ static void iperf_server_test(void)
 
             /* Check silence timeout - remove client */
             if (silence_ms >= silence_timeout_ms) {
-                /* Print final summary for this client */
+                /* Print final summary for this client with sender/receiver */
                 double total_sec = (double)(c->last_pkt.QuadPart - c->first_pkt.QuadPart) / freq.QuadPart;
-                double avg_bps = (total_sec > 0) ? (double)c->total_bytes * 8 / total_sec : 0;
-                char bw_str[32], bytes_str[32];
-                format_bps(avg_bps, bw_str, sizeof(bw_str));
-                format_bytes(c->total_bytes, bytes_str, sizeof(bytes_str));
+                double recv_bps = (total_sec > 0) ? (double)c->recv_bytes * 8 / total_sec : 0;
+                double send_bps = (total_sec > 0) ? (double)c->send_bytes * 8 / total_sec : 0;
+                char recv_bw[32], recv_str[32], send_bw[32], send_str[32];
+                format_bps(recv_bps, recv_bw, sizeof(recv_bw));
+                format_bytes(c->recv_bytes, recv_str, sizeof(recv_str));
+                format_bps(send_bps, send_bw, sizeof(send_bw));
+                format_bytes(c->send_bytes, send_str, sizeof(send_str));
 
-                printf("[%3d]  0.00-%5.2f sec  %s  %s/sec\n",
-                       c->id, total_sec, bytes_str, bw_str);
-                printf("[  %d] done.\n", c->id);
+                printf("\n- - - - - - - - - - - - - - - - - - - - - - - - -\n");
+                printf("[ ID] Interval           Transfer     Bandwidth\n");
+                printf("[%3d]  0.00-%5.2f sec  %s  %s/sec                  sender\n",
+                       c->id, total_sec, send_str, send_bw);
+                printf("[%3d]  0.00-%5.2f sec  %s  %s/sec                  receiver\n",
+                       c->id, total_sec, recv_str, recv_bw);
 
                 c->active = 0;
                 total_clients_served++;
@@ -1198,27 +1240,27 @@ static void iperf_server_test(void)
 
             /* Check report interval */
             double interval_sec = (double)(now.QuadPart - c->interval_start.QuadPart) / freq.QuadPart;
-            if (interval_sec >= g_report_interval && c->interval_pkts > 0) {
-                double bps = (double)c->interval_bytes * 8 / interval_sec;
+            if (interval_sec >= g_report_interval && c->interval_recv > 0) {
+                double recv_bps = (double)c->interval_recv * 8 / interval_sec;
                 double elapsed = (double)(now.QuadPart - c->first_pkt.QuadPart) / freq.QuadPart;
                 double interval_start_sec = (double)(c->interval_start.QuadPart - c->first_pkt.QuadPart) / freq.QuadPart;
                 char bw_str[32], bytes_str[32];
-                format_bps(bps, bw_str, sizeof(bw_str));
-                format_bytes(c->interval_bytes, bytes_str, sizeof(bytes_str));
+                format_bps(recv_bps, bw_str, sizeof(bw_str));
+                format_bytes(c->interval_recv, bytes_str, sizeof(bytes_str));
 
                 /* iperf format: [ID]  start-end  sec  Transfer  Bandwidth */
                 printf("[%3d] %5.2f-%5.2f sec  %s  %s/sec\n",
                        c->id, interval_start_sec, elapsed, bytes_str, bw_str);
 
-                c->interval_bytes = 0;
-                c->interval_pkts = 0;
+                c->interval_recv = 0;
+                c->interval_send = 0;
                 c->interval_start = now;
                 fflush(stdout);
             }
         }
     }
 
-    /* Print summary for any remaining active clients */
+    /* Print overall summary for any remaining active clients */
     printf("\n========================================\n");
     printf("  Server stopped. Total clients served: %d\n", total_clients_served);
     printf("========================================\n");
