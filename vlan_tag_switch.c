@@ -1075,7 +1075,7 @@ static void iperf_client_test(void)
             format_bps(send_bps, bw_str, sizeof(bw_str));
             format_bytes(interval_send, bytes_str, sizeof(bytes_str));
             /* iperf format: [ID]  start-end  sec  Transfer  Bandwidth */
-            printf("[  1] %5.2f-%5.2f sec  %s  %s/sec\n",
+            printf("[  1] %5.2f-%5.2f sec  %s  %s\n",
                    interval_start_sec, elapsed_sec, bytes_str, bw_str);
 
             interval_send = 0;
@@ -1104,15 +1104,15 @@ static void iperf_client_test(void)
     format_bytes(recv_bytes, recv_bytes_str, sizeof(recv_bytes_str));
 
     /* Print final summary in iperf format */
-    printf("[  1]  0.00-%5.2f sec  %s  %s/sec\n",
+    printf("[  1]  0.00-%5.2f sec  %s  %s\n",
            total_sec, send_bytes_str, send_bw);
 
     /* Print summary */
     printf("\n- - - - - - - - - - - - - - - - - - - - - - - - -\n");
     printf("[ ID] Interval           Transfer     Bandwidth\n");
-    printf("[  1]  0.00-%5.2f sec  %s  %s/sec                  sender\n",
+    printf("[  1]  0.00-%5.2f sec  %s  %s                  sender\n",
            total_sec, send_bytes_str, send_bw);
-    printf("[  1]  0.00-%5.2f sec  %s  %s/sec                  receiver\n",
+    printf("[  1]  0.00-%5.2f sec  %s  %s                  receiver\n",
            total_sec, recv_bytes_str, recv_bw);
     printf("\nTest complete. Sent %llu packets, Received %llu packets in %.2f seconds.\n",
            (unsigned long long)send_pkts, (unsigned long long)recv_pkts, total_sec);
@@ -1280,9 +1280,9 @@ static void iperf_server_test(void)
 
                 printf("\n- - - - - - - - - - - - - - - - - - - - - - - - -\n");
                 printf("[ ID] Interval           Transfer     Bandwidth\n");
-                printf("[%3d]  0.00-%5.2f sec  %s  %s/sec                  sender\n",
+                printf("[%3d]  0.00-%5.2f sec  %s  %s                  sender\n",
                        c->id, total_sec, send_str, send_bw);
-                printf("[%3d]  0.00-%5.2f sec  %s  %s/sec                  receiver\n",
+                printf("[%3d]  0.00-%5.2f sec  %s  %s                  receiver\n",
                        c->id, total_sec, recv_str, recv_bw);
 
                 c->active = 0;  /* mark inactive but keep ID for reuse */
@@ -1301,7 +1301,7 @@ static void iperf_server_test(void)
                 format_bytes(c->interval_recv, bytes_str, sizeof(bytes_str));
 
                 /* iperf format: [ID]  start-end  sec  Transfer  Bandwidth */
-                printf("[%3d] %5.2f-%5.2f sec  %s  %s/sec\n",
+                printf("[%3d] %5.2f-%5.2f sec  %s  %s\n",
                        c->id, interval_start_sec, elapsed, bytes_str, bw_str);
 
                 c->interval_recv = 0;
