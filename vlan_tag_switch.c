@@ -180,6 +180,25 @@ typedef struct {
 
 #pragma pack(pop)
 
+/* Max concurrent clients supported by server */
+#define MAX_CLIENTS 32
+
+/* Per-client tracking info for multi-client server */
+typedef struct {
+    int      id;                /* client ID number (1-based) */
+    int      active;            /* 1 = active, 0 = timed out / removed */
+    uint8_t  src_mac[6];
+    uint8_t  src_ip[4];
+    uint16_t src_port;
+    uint64_t total_bytes;       /* total bytes received from this client */
+    uint64_t total_pkts;        /* total packets received */
+    uint64_t interval_bytes;    /* bytes in current report interval */
+    uint64_t interval_pkts;     /* packets in current report interval */
+    LARGE_INTEGER first_pkt;    /* timestamp of first packet */
+    LARGE_INTEGER last_pkt;     /* timestamp of last packet */
+    LARGE_INTEGER interval_start; /* start of current report interval */
+} client_info_t;
+
 /*=======================================================================
  * Utility functions
  *=====================================================================*/
@@ -1039,27 +1058,85 @@ static void iperf_client_test(void)
 }
 
 /*
- * iperf server test
+ * Find or create a client entry by src_ip:src_port.
+ * Returns pointer to client_info_t, or NULL if table full.
+ */
+static client_info_t *find_or_create_client(client_info_t clients[], int *client_count,
+                                            int *next_id,
+                                            const uint8_t *src_ip, uint16_t src_port,
+                                            const uint8_t *src_mac, LARGE_INTEGER now)
+{
+    /* Search for existing client */
+    for (int i = 0; i < *client_count; i++) {
+        if (clients[i].active &&
+            memcmp(clients[i].src_ip, src_ip, 4) == 0 &&
+            clients[i].src_port == src_port) {
+            return &clients[i];
+        }
+    }
+
+    /* Find a free slot (either inactive or beyond current count) */
+    int slot = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) return NULL;  /* table full */
+
+    /* Initialize new client */
+    client_info_t *c = &clients[slot];
+    c->id = (*next_id)++;
+    c->active = 1;
+    memcpy(c->src_mac, src_mac, 6);
+    memcpy(c->src_ip, src_ip, 4);
+    c->src_port = src_port;
+    c->total_bytes = 0;
+    c->total_pkts = 0;
+    c->interval_bytes = 0;
+    c->interval_pkts = 0;
+    c->first_pkt = now;
+    c->last_pkt = now;
+    c->interval_start = now;
+
+    if (slot >= *client_count) *client_count = slot + 1;
+
+    /* Print new client connection */
+    printf("[  %d] local %u.%u.%u.%u port %u connected to %u.%u.%u.%u port %u\n",
+           c->id,
+           g_my_ip[0], g_my_ip[1], g_my_ip[2], g_my_ip[3], g_listen_port,
+           src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port);
+
+    return c;
+}
+
+/*
+ * iperf server test - supports multiple concurrent clients
+ * Output format matches iperf:
+ *   [ ID] Interval           Transfer     Bandwidth
+ *   [  4]  0.00-1.00   sec  7.45 MBytes  62.5 Mbits/sec
  */
 static void iperf_server_test(void)
 {
     uint8_t src_mac[6], src_ip[4];
     uint16_t src_port;
     uint8_t payload[MAX_PACKET_LEN];
-
-    uint64_t total_bytes = 0;
-    uint64_t total_pkts = 0;
-    int first_pkt = 1;
     int is_vlan;
+    int is_tcp = 0;
 
-    LARGE_INTEGER freq, start;
+    client_info_t clients[MAX_CLIENTS];
+    memset(clients, 0, sizeof(clients));
+    int client_count = 0;
+    int next_id = 1;
+    int total_clients_served = 0;
+
+    LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&start);
+    LARGE_INTEGER server_start;
+    QueryPerformanceCounter(&server_start);
 
-    uint64_t interval_bytes = 0;
-    uint64_t interval_pkts = 0;
-    LARGE_INTEGER interval_start;
-    QueryPerformanceCounter(&interval_start);
+    int silence_timeout_ms = g_silence_timeout * 1000;
 
     printf("\n--- iperf Server Receive ---\n");
     printf("  Listen Port: %u\n", g_listen_port);
@@ -1068,101 +1145,88 @@ static void iperf_server_test(void)
     } else {
         printf("  VLAN: None\n");
     }
-    printf("  Timeout: %d sec (auto-stop after silence)\n", g_silence_timeout);
+    printf("  Protocol: %s\n", g_protocol == PROTO_TCP ? "TCP" : "UDP");
+    printf("  Timeout: %d sec (per-client auto-remove after silence)\n", g_silence_timeout);
     printf("========================================\n\n");
 
-    int is_tcp = 0;
-    LARGE_INTEGER last_pkt_time;
-    QueryPerformanceCounter(&last_pkt_time);
-    int silence_timeout_ms = g_silence_timeout * 1000;
-
-    LARGE_INTEGER new_flow_start;  /* for detecting new flows after a gap */
-    QueryPerformanceCounter(&new_flow_start);
-    int gap_sec = g_report_interval * 2;  /* gap > 2x interval = new flow */
+    /* Print header like iperf */
+    printf("[ ID] Interval           Transfer     Bandwidth\n");
 
     while (g_running) {
         int payload_len = recv_packet(g_listen_port, src_mac, src_ip, &src_port,
                                       payload, sizeof(payload) - 1, 100, &is_vlan, &is_tcp, g_protocol);
-        if (payload_len >= (int)sizeof(test_header_t)) {
-            test_header_t *test_hdr = (test_header_t *)payload;
-            (void)test_hdr;  /* payload already validated */
-
-            /* Detect new flow: if gap since last packet > threshold, reset timing */
-            LARGE_INTEGER pkt_time;
-            QueryPerformanceCounter(&pkt_time);
-            double gap_since_last = (double)(pkt_time.QuadPart - last_pkt_time.QuadPart) / freq.QuadPart;
-
-            if (first_pkt) {
-                first_pkt = 0;
-                /* First packet ever - reset start time */
-                start = pkt_time;
-                new_flow_start = pkt_time;
-                interval_start = pkt_time;
-            } else if (gap_since_last > gap_sec) {
-                /* New flow detected after a gap - reset timing */
-                start = pkt_time;
-                new_flow_start = pkt_time;
-                interval_start = pkt_time;
-                interval_bytes = 0;
-                interval_pkts = 0;
-            }
-
-            int transport_hdr_len = (g_protocol == PROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
-            int hdr_len = get_frame_header_len();
-            total_bytes += payload_len + hdr_len + IP_HDR_LEN + transport_hdr_len;
-            total_pkts++;
-            interval_bytes += payload_len + hdr_len + IP_HDR_LEN + transport_hdr_len;
-            interval_pkts++;
-
-            /* Reset silence timer on every received packet */
-            QueryPerformanceCounter(&last_pkt_time);
-        }
 
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
 
-        /* Check silence timeout - auto stop if no packets for silence_timeout_ms */
-        double silence_ms = (double)(now.QuadPart - last_pkt_time.QuadPart) * 1000.0 / freq.QuadPart;
-        if (!first_pkt && silence_ms >= silence_timeout_ms) {
-            break;
+        if (payload_len >= (int)sizeof(test_header_t)) {
+            /* Find or create client */
+            client_info_t *c = find_or_create_client(clients, &client_count, &next_id,
+                                                     src_ip, src_port, src_mac, now);
+            if (c) {
+                int transport_hdr_len = (g_protocol == PROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
+                int hdr_len = get_frame_header_len();
+                uint64_t frame_len = payload_len + hdr_len + IP_HDR_LEN + transport_hdr_len;
+
+                c->total_bytes += frame_len;
+                c->total_pkts++;
+                c->interval_bytes += frame_len;
+                c->interval_pkts++;
+                c->last_pkt = now;
+            }
         }
 
-        double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
-        if (interval_sec >= g_report_interval) {
-            /* Only print if we received packets this interval */
-            if (interval_pkts > 0) {
-                double bps = (double)interval_bytes * 8 / interval_sec;
+        /* Check all clients for interval report and silence timeout */
+        for (int i = 0; i < client_count; i++) {
+            client_info_t *c = &clients[i];
+            if (!c->active) continue;
+
+            double silence_ms = (double)(now.QuadPart - c->last_pkt.QuadPart) * 1000.0 / freq.QuadPart;
+
+            /* Check silence timeout - remove client */
+            if (silence_ms >= silence_timeout_ms) {
+                /* Print final summary for this client */
+                double total_sec = (double)(c->last_pkt.QuadPart - c->first_pkt.QuadPart) / freq.QuadPart;
+                double avg_bps = (total_sec > 0) ? (double)c->total_bytes * 8 / total_sec : 0;
                 char bw_str[32], bytes_str[32];
-                format_bps(bps, bw_str, sizeof(bw_str));
-                format_bytes(interval_bytes, bytes_str, sizeof(bytes_str));
-                printf("  [%5.1fs] %s  %s/s  %llu packets\n",
-                       (double)(now.QuadPart - start.QuadPart) / freq.QuadPart,
-                       bytes_str, bw_str,
-                       (unsigned long long)interval_pkts);
+                format_bps(avg_bps, bw_str, sizeof(bw_str));
+                format_bytes(c->total_bytes, bytes_str, sizeof(bytes_str));
+
+                printf("[%3d]  0.00-%5.2f sec  %s  %s/sec\n",
+                       c->id, total_sec, bytes_str, bw_str);
+                printf("[  %d] done.\n", c->id);
+
+                c->active = 0;
+                total_clients_served++;
+                fflush(stdout);
+                continue;
             }
 
-            interval_bytes = 0;
-            interval_pkts = 0;
-            interval_start = now;
-            fflush(stdout);
+            /* Check report interval */
+            double interval_sec = (double)(now.QuadPart - c->interval_start.QuadPart) / freq.QuadPart;
+            if (interval_sec >= g_report_interval && c->interval_pkts > 0) {
+                double bps = (double)c->interval_bytes * 8 / interval_sec;
+                double elapsed = (double)(now.QuadPart - c->first_pkt.QuadPart) / freq.QuadPart;
+                double interval_start_sec = (double)(c->interval_start.QuadPart - c->first_pkt.QuadPart) / freq.QuadPart;
+                char bw_str[32], bytes_str[32];
+                format_bps(bps, bw_str, sizeof(bw_str));
+                format_bytes(c->interval_bytes, bytes_str, sizeof(bytes_str));
+
+                /* iperf format: [ID]  start-end  sec  Transfer  Bandwidth */
+                printf("[%3d] %5.2f-%5.2f sec  %s  %s/sec\n",
+                       c->id, interval_start_sec, elapsed, bytes_str, bw_str);
+
+                c->interval_bytes = 0;
+                c->interval_pkts = 0;
+                c->interval_start = now;
+                fflush(stdout);
+            }
         }
     }
 
-    LARGE_INTEGER end;
-    QueryPerformanceCounter(&end);
-    double total_sec = (double)(end.QuadPart - start.QuadPart) / freq.QuadPart;
-    double avg_bps = (total_sec > 0) ? (double)total_bytes * 8 / total_sec : 0;
-
-    char bw_str[32], bytes_str[32];
-    format_bps(avg_bps, bw_str, sizeof(bw_str));
-    format_bytes(total_bytes, bytes_str, sizeof(bytes_str));
-
+    /* Print summary for any remaining active clients */
     printf("\n========================================\n");
-    printf("  [Test Complete]\n");
-    printf("  Total Time: %.2f sec\n", total_sec);
-    printf("  Total Data: %s\n", bytes_str);
-    printf("  Total Pkts: %llu\n", (unsigned long long)total_pkts);
-    printf("  Avg Bandwidth: %s\n", bw_str);
+    printf("  Server stopped. Total clients served: %d\n", total_clients_served);
     printf("========================================\n");
 }
 
