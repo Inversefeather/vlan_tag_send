@@ -1093,23 +1093,49 @@ static void iperf_client_test(void)
 static client_info_t *find_or_create_client(client_info_t clients[], int *client_count,
                                             int *next_id,
                                             const uint8_t *src_ip, uint16_t src_port,
-                                            const uint8_t *src_mac, LARGE_INTEGER now)
+                                            const uint8_t *src_mac, LARGE_INTEGER now,
+                                            int *is_new)
 {
-    /* Search for existing client */
+    *is_new = 0;
+
+    /* Search for existing client (active or inactive) by IP:port */
     for (int i = 0; i < *client_count; i++) {
-        if (clients[i].active &&
-            memcmp(clients[i].src_ip, src_ip, 4) == 0 &&
+        if (memcmp(clients[i].src_ip, src_ip, 4) == 0 &&
             clients[i].src_port == src_port) {
-            return &clients[i];
+            /* Same client found - reuse ID, reset stats for new flow */
+            client_info_t *c = &clients[i];
+            if (!c->active) {
+                /* Client was inactive (timed out) - reactivate with same ID */
+                c->active = 1;
+                c->recv_bytes = 0;
+                c->recv_pkts = 0;
+                c->interval_recv = 0;
+                c->send_bytes = 0;
+                c->send_pkts = 0;
+                c->interval_send = 0;
+                c->first_pkt = now;
+                c->last_pkt = now;
+                c->interval_start = now;
+            }
+            return c;
         }
     }
 
     /* Find a free slot (either inactive or beyond current count) */
     int slot = -1;
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (!clients[i].active) {
+        if (!clients[i].active && clients[i].id == 0) {
             slot = i;
             break;
+        }
+    }
+    if (slot < 0) {
+        /* No free slot, try to reuse an inactive one */
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (!clients[i].active) {
+                slot = i;
+                break;
+            }
         }
     }
     if (slot < 0) return NULL;  /* table full */
@@ -1132,12 +1158,7 @@ static client_info_t *find_or_create_client(client_info_t clients[], int *client
     c->interval_start = now;
 
     if (slot >= *client_count) *client_count = slot + 1;
-
-    /* Print new client connection */
-    printf("[  %d] local %u.%u.%u.%u port %u connected to %u.%u.%u.%u port %u\n",
-           c->id,
-           g_my_ip[0], g_my_ip[1], g_my_ip[2], g_my_ip[3], g_listen_port,
-           src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port);
+    *is_new = 1;
 
     return c;
 }
@@ -1160,7 +1181,6 @@ static void iperf_server_test(void)
     memset(clients, 0, sizeof(clients));
     int client_count = 0;
     int next_id = 1;
-    int total_clients_served = 0;
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
@@ -1192,8 +1212,9 @@ static void iperf_server_test(void)
 
         if (payload_len >= (int)sizeof(test_header_t)) {
             /* Find or create client */
+            int is_new = 0;
             client_info_t *c = find_or_create_client(clients, &client_count, &next_id,
-                                                     src_ip, src_port, src_mac, now);
+                                                     src_ip, src_port, src_mac, now, &is_new);
             if (c) {
                 int transport_hdr_len = (g_protocol == PROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
                 int hdr_len = get_frame_header_len();
@@ -1213,7 +1234,7 @@ static void iperf_server_test(void)
 
             double silence_ms = (double)(now.QuadPart - c->last_pkt.QuadPart) * 1000.0 / freq.QuadPart;
 
-            /* Check silence timeout - remove client */
+            /* Check silence timeout - print summary and mark inactive */
             if (silence_ms >= silence_timeout_ms) {
                 /* Print final summary for this client with sender/receiver */
                 double total_sec = (double)(c->last_pkt.QuadPart - c->first_pkt.QuadPart) / freq.QuadPart;
@@ -1232,8 +1253,7 @@ static void iperf_server_test(void)
                 printf("[%3d]  0.00-%5.2f sec  %s  %s/sec                  receiver\n",
                        c->id, total_sec, recv_str, recv_bw);
 
-                c->active = 0;
-                total_clients_served++;
+                c->active = 0;  /* mark inactive but keep ID for reuse */
                 fflush(stdout);
                 continue;
             }
@@ -1259,11 +1279,6 @@ static void iperf_server_test(void)
             }
         }
     }
-
-    /* Print overall summary for any remaining active clients */
-    printf("\n========================================\n");
-    printf("  Server stopped. Total clients served: %d\n", total_clients_served);
-    printf("========================================\n");
 }
 
 /*=======================================================================
