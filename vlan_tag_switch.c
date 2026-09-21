@@ -1220,13 +1220,9 @@ static int raw_open(const char *target_ip)
             info = (IP_ADAPTER_INFO *)malloc(buf_len);
             if (info && GetAdaptersInfo(info, &buf_len) == NO_ERROR) {
                 for (p = info; p; p = p->Next) {
-                    struct in_addr ia;
-                    ia.s_addr = *(uint32_t *)&p->IpAddressList.IpAddress.String;
-                    /* compare as uint32 */
-                    uint32_t have = *(uint32_t *)g_my_ip;
-                    if (have != 0 && memcmp(&ia.s_addr, g_my_ip, 4) == 0) {
-                        for (int i = 0; i < 6; i++)
-                            g_my_mac[i] = (uint8_t)p->Address[i];
+                    uint32_t adapter_ip = inet_addr(p->IpAddressList.IpAddress.String);
+                    if (adapter_ip != 0 && memcmp(&adapter_ip, g_my_ip, 4) == 0) {
+                        memcpy(g_my_mac, p->Address, min(p->AddressLength, 6));
                         mac = g_my_mac;
                         break;
                     }
