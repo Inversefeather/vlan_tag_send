@@ -1518,7 +1518,6 @@ static void raw_server_test(void)
 
     uint64_t total_recv = 0;
     uint64_t interval_recv = 0;
-    uint64_t total_raw_pkts = 0;  /* debug: all packets seen */
     LARGE_INTEGER freq, start, interval_start, now;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
@@ -1530,76 +1529,55 @@ static void raw_server_test(void)
         const uint8_t *pkt;
         int r = pcap_next_ex(g_handle, &hdr, &pkt);
 
-        if (r == 1) {
-            total_raw_pkts++;
+        if (r == 1 && hdr->len >= ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN) {
+            eth_header_t *eth = (eth_header_t *)pkt;
+            uint16_t et = ntohs(eth->ethertype);
+            uint8_t *ip_pkt;
 
-            if (hdr->len >= ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN) {
-                eth_header_t *eth = (eth_header_t *)pkt;
-                uint16_t et = ntohs(eth->ethertype);
-                uint8_t *ip_pkt;
-
-                if (et == ETHERTYPE_VLAN) {
-                    if (hdr->len < VLAN_ETH_HDR_LEN + IP_HDR_LEN) goto next;
-                    uint16_t tci = ntohs(*(uint16_t *)(pkt + ETH_HDR_LEN + 2));
-                    if ((tci & VLAN_VID_MASK) != g_vlan_id) {
-                        fprintf(stderr, "[debug] VLAN ID mismatch: got %u, expected %u\n",
-                                tci & VLAN_VID_MASK, g_vlan_id);
-                        goto next;
-                    }
-                    ip_pkt = (uint8_t *)eth + VLAN_ETH_HDR_LEN;
-                } else if (et == ETHERTYPE_IP) {
-                    if (g_vlan_id > 0) {
-                        fprintf(stderr, "[debug] got untagged IP frame, expected VLAN %u\n", g_vlan_id);
-                        goto next;
-                    }
-                    ip_pkt = (uint8_t *)eth + ETH_HDR_LEN;
-                } else {
-                    fprintf(stderr, "[debug] ethertype 0x%04X, not IP/VLAN\n", et);
-                    goto next;
-                }
-
-                ip_header_t *ip = (ip_header_t *)ip_pkt;
-                if (ip->protocol != IP_PROTOCOL_UDP) {
-                    fprintf(stderr, "[debug] IP protocol %u, not UDP\n", ip->protocol);
-                    goto next;
-                }
-                udp_header_t *udp = (udp_header_t *)(ip_pkt + IP_HDR_LEN);
-                if (ntohs(udp->dst_port) != (uint16_t)g_port) {
-                    fprintf(stderr, "[debug] UDP dst port %u, expected %u\n",
-                            ntohs(udp->dst_port), g_port);
-                    goto next;
-                }
-
-                int plen = ntohs(ip->total_len) - IP_HDR_LEN - UDP_HDR_LEN;
-                total_recv += (plen > 0) ? plen : 0;
-                interval_recv += (plen > 0) ? plen : 0;
-                deadline = GetTickCount() + g_silence_timeout * 1000;
-
-                QueryPerformanceCounter(&now);
-                double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
-                if (interval_sec >= g_report_interval && interval_recv > 0) {
-                    double bps = (double)interval_recv * 8 / interval_sec;
-                    double elapsed = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
-                    char bw_str[32], bytes_str[32];
-                    format_bps(bps, bw_str, sizeof(bw_str));
-                    format_bytes(interval_recv, bytes_str, sizeof(bytes_str));
-                    printf("[  3] %5.2f-%5.2f sec  %s  %s\n",
-                           (double)(interval_start.QuadPart - start.QuadPart) / freq.QuadPart,
-                           elapsed, bytes_str, bw_str);
-                    interval_recv = 0;
-                    interval_start = now;
-                    fflush(stdout);
-                }
+            if (et == ETHERTYPE_VLAN) {
+                if (g_vlan_id == 0 || hdr->len < VLAN_ETH_HDR_LEN + IP_HDR_LEN) continue;
+                uint16_t tci = ntohs(*(uint16_t *)(pkt + ETH_HDR_LEN + 2));
+                if ((tci & VLAN_VID_MASK) != g_vlan_id) continue;
+                ip_pkt = (uint8_t *)eth + VLAN_ETH_HDR_LEN;
+            } else if (et == ETHERTYPE_IP) {
+                if (g_vlan_id > 0) continue;   /* strict: expect tagged */
+                ip_pkt = (uint8_t *)eth + ETH_HDR_LEN;
+            } else {
+                continue;
             }
-            next:;
+
+            ip_header_t *ip = (ip_header_t *)ip_pkt;
+            if (ip->protocol != IP_PROTOCOL_UDP) continue;
+            udp_header_t *udp = (udp_header_t *)(ip_pkt + IP_HDR_LEN);
+            if (ntohs(udp->dst_port) != (uint16_t)g_port) continue;
+
+            int plen = ntohs(ip->total_len) - IP_HDR_LEN - UDP_HDR_LEN;
+            total_recv += (plen > 0) ? plen : 0;
+            interval_recv += (plen > 0) ? plen : 0;
+            deadline = GetTickCount() + g_silence_timeout * 1000;
+
+            QueryPerformanceCounter(&now);
+            double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
+            if (interval_sec >= g_report_interval && interval_recv > 0) {
+                double bps = (double)interval_recv * 8 / interval_sec;
+                double elapsed = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
+                char bw_str[32], bytes_str[32];
+                format_bps(bps, bw_str, sizeof(bw_str));
+                format_bytes(interval_recv, bytes_str, sizeof(bytes_str));
+                printf("[  3] %5.2f-%5.2f sec  %s  %s\n",
+                       (double)(interval_start.QuadPart - start.QuadPart) / freq.QuadPart,
+                       elapsed, bytes_str, bw_str);
+                interval_recv = 0;
+                interval_start = now;
+                fflush(stdout);
+            }
         } else if (r == -1) {
             fprintf(stderr, "\nError: pcap_next_ex: %s\n", pcap_geterr(g_handle));
             break;
         }
 
         if ((int)(GetTickCount() - deadline) >= 0) {
-            printf("\nNo matching frames for %d seconds (saw %llu raw packets), stopping.\n",
-                   g_silence_timeout, (unsigned long long)total_raw_pkts);
+            printf("\nNo frames for %d seconds, stopping.\n", g_silence_timeout);
             break;
         }
     }
@@ -1860,6 +1838,12 @@ int main(int argc, char *argv[])
                 g_port = port;
             }
         }
+    }
+
+    /* VLAN requires raw mode (socket mode cannot set VLAN tag) */
+    if (g_vlan_id > 0 && !g_use_raw) {
+        printf("NOTE: VLAN %u requested without --raw. Auto-enabling raw mode.\n\n", g_vlan_id);
+        g_use_raw = 1;
     }
 
     /* Raw mode only supports UDP (TCP handshake not feasible with raw frames) */
