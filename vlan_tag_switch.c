@@ -41,6 +41,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <mmsystem.h>
 #include <iphlpapi.h>
 #include <conio.h>
 
@@ -56,7 +57,8 @@ typedef unsigned long  u_long;
 /* Constants */
 #define DEFAULT_PORT        9999
 #define DEFAULT_DURATION    10
-#define DEFAULT_BUFSIZE     1400
+#define DEFAULT_BUFSIZE_TCP 65536   /* Large buffer = fewer syscalls for TCP */
+#define DEFAULT_BUFSIZE_UDP 1400    /* Standard MTU-sized for UDP */
 #define DEFAULT_INTERVAL    1
 #define MAX_BUFSIZE         65536
 
@@ -96,7 +98,7 @@ static int g_mode = MODE_NONE;
 static int g_protocol = PROTO_TCP;
 static int g_port = DEFAULT_PORT;
 static int g_duration = DEFAULT_DURATION;
-static int g_bufsize = DEFAULT_BUFSIZE;
+static int g_bufsize = 0;  /* 0 = not set, choose based on protocol */
 static int g_report_interval = DEFAULT_INTERVAL;
 static double g_target_bps = 0;
 static uint64_t g_nbytes = 0;
@@ -282,16 +284,14 @@ static void tcp_client_test(void)
             fflush(stdout);
         }
 
-        /* Pacing: if target bandwidth set, sleep to maintain rate */
+        /* Pacing: busy-wait until time to send more data */
         if (g_target_bps > 0) {
-            QueryPerformanceCounter(&now);
-            double elapsed_now = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
-            double expected_sec = (double)total_sent * 8.0 / g_target_bps;
-            if (expected_sec > elapsed_now) {
-                double sleep_sec = expected_sec - elapsed_now;
-                if (sleep_sec > 0.0005) {
-                    Sleep((DWORD)(sleep_sec * 1000.0 + 0.5));
-                }
+            double should_have_sent = (double)total_sent * 8.0 / g_target_bps;
+            while (g_running) {
+                QueryPerformanceCounter(&now);
+                double elapsed_now = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
+                if (elapsed_now >= should_have_sent) break;
+                YieldProcessor();  /* Spin-wait, no Sleep() latency */
             }
         }
     }
@@ -532,12 +532,9 @@ static void udp_client_test(void)
             if (sent == SOCKET_ERROR) {
                 int err = WSAGetLastError();
                 if (err == WSAEWOULDBLOCK) {
-                    /* Socket buffer full — wait with select() */
-                    fd_set writefds;
-                    FD_ZERO(&writefds);
-                    FD_SET(sock, &writefds);
-                    struct timeval tv = {0, 100};  /* 100µs */
-                    select(0, NULL, &writefds, NULL, &tv);
+                    /* Socket buffer full — brief busy-wait then retry */
+                    for (int spin = 0; spin < 100 && g_running; spin++)
+                        YieldProcessor();
                     continue;
                 }
                 fprintf(stderr, "\nError: sendto() failed: %d\n", err);
@@ -548,8 +545,8 @@ static void udp_client_test(void)
             total_sent += sent;
             interval_sent += sent;
         } else {
-            /* Ahead of schedule — yield CPU, don't burn 15ms on Sleep(1) */
-            Sleep(0);
+            /* Ahead of schedule — busy-wait for accurate pacing */
+            YieldProcessor();
         }
 
         /* Report interval */
@@ -950,8 +947,8 @@ static void usage(const char *prog)
     printf("  -b, --bandwidth #[KMG]    Target bandwidth in bits/sec (default unlimited)\n");
     printf("  -t, --time      #         Time in seconds to transmit (default %d)\n", DEFAULT_DURATION);
     printf("  -n, --bytes     #[KMG]    Number of bytes to transmit (instead of -t)\n");
-    printf("  -l, --len       #         Buffer size to read/write (default %d, max %d)\n",
-           DEFAULT_BUFSIZE, MAX_BUFSIZE);
+    printf("  -l, --len       #         Buffer size (TCP default %d, UDP default %d, max %d)\n",
+           DEFAULT_BUFSIZE_TCP, DEFAULT_BUFSIZE_UDP, MAX_BUFSIZE);
     printf("  -i, --interval  #         Seconds between bandwidth reports (default %d)\n", DEFAULT_INTERVAL);
     printf("      --interactive         Interactive mode (chat-like)\n");
     printf("\n");
@@ -1196,9 +1193,18 @@ int main(int argc, char *argv[])
     } else {
         printf(" Timeout   : %d sec (auto-stop)\n", g_silence_timeout);
     }
+    /* Choose default buffer size based on protocol if not set by user */
+    if (g_bufsize <= 0) {
+        g_bufsize = (g_protocol == PROTO_TCP) ? DEFAULT_BUFSIZE_TCP : DEFAULT_BUFSIZE_UDP;
+    }
+    if (g_bufsize > MAX_BUFSIZE) g_bufsize = MAX_BUFSIZE;
+
     printf(" Buf Size  : %d bytes\n", g_bufsize);
     printf(" Interval  : %d sec (report interval)\n", g_report_interval);
     printf("========================================\n");
+
+    /* Improve Windows timer resolution for accurate pacing */
+    timeBeginPeriod(1);
 
     /* Run test */
     if (g_interactive) {
@@ -1224,6 +1230,7 @@ int main(int argc, char *argv[])
     }
 
     printf("\nStopped.\n");
+    timeEndPeriod(1);
     WSACleanup();
     return 0;
 }

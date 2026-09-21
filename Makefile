@@ -16,7 +16,7 @@ CC ?= clang
 CFLAGS = -Wall -Wextra -O2 -std=c11
 
 # Link libraries (Winsock + IP helper)
-LIBS = -lws2_32 -liphlpapi
+LIBS = -lws2_32 -liphlpapi -lwinmm
 
 TARGET = vlan_tag_switch.exe
 
