@@ -1427,12 +1427,87 @@ static void raw_client_test(void)
     g_handle = NULL;
 }
 
+/* Open the first non-loopback Ethernet adapter (for server mode) */
+static int raw_open_first_device(void)
+{
+    pcap_if_t *alldevs = NULL, *d;
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+        fprintf(stderr, "Error: pcap_findalldevs: %s\n", errbuf);
+        return -1;
+    }
+
+    /* Find first non-loopback device with an IPv4 address */
+    for (d = alldevs; d; d = d->next) {
+        if (d->flags & PCAP_IF_LOOPBACK) continue;
+
+        pcap_addr_t *a;
+        for (a = d->addresses; a; a = a->next) {
+            if (a->addr && a->addr->sa_family == AF_INET) {
+                /* Found candidate */
+                char dev_name[1024];
+                snprintf(dev_name, sizeof(dev_name), "%s", d->name);
+
+                g_handle = pcap_open_live(dev_name, 65536, 1, 100, errbuf);
+                if (!g_handle) {
+                    fprintf(stderr, "Error: pcap_open_live(%s) failed: %s\n", dev_name, errbuf);
+                    continue;
+                }
+
+                if (pcap_datalink(g_handle) != DLT_EN10MB) {
+                    pcap_close(g_handle);
+                    g_handle = NULL;
+                    continue;
+                }
+
+                /* Get IP + MAC */
+                struct sockaddr_in *s = (struct sockaddr_in *)a->addr;
+                memcpy(g_my_ip, &s->sin_addr.s_addr, 4);
+
+                /* Get MAC via IP Helper */
+                IP_ADAPTER_INFO *info = NULL, *p;
+                ULONG buf_len = 0;
+                if (GetAdaptersInfo(NULL, &buf_len) == ERROR_BUFFER_OVERFLOW) {
+                    info = (IP_ADAPTER_INFO *)malloc(buf_len);
+                    if (info && GetAdaptersInfo(info, &buf_len) == NO_ERROR) {
+                        for (p = info; p; p = p->Next) {
+                            uint32_t ip = 0;
+                            inet_pton(AF_INET, p->IpAddressList.IpAddress.String, &ip);
+                            if (ip != 0 && memcmp(&ip, g_my_ip, 4) == 0) {
+                                memcpy(g_my_mac, p->Address, min(p->AddressLength, 6));
+                                break;
+                            }
+                        }
+                    }
+                    free(info);
+                }
+
+                if (memcmp(g_my_mac, "\x00\x00\x00\x00\x00\x00", 6) == 0) {
+                    fprintf(stderr, "Warning: cannot determine MAC for %s, using zeros\n", dev_name);
+                }
+
+                printf("Raw mode: device=%s MAC=%02X:%02X:%02X:%02X:%02X:%02X IP=%u.%u.%u.%u\n",
+                       dev_name,
+                       g_my_mac[0], g_my_mac[1], g_my_mac[2],
+                       g_my_mac[3], g_my_mac[4], g_my_mac[5],
+                       g_my_ip[0], g_my_ip[1], g_my_ip[2], g_my_ip[3]);
+
+                pcap_freealldevs(alldevs);
+                return 0;
+            }
+        }
+    }
+
+    pcap_freealldevs(alldevs);
+    fprintf(stderr, "Error: no suitable non-loopback Ethernet adapter found\n");
+    return -1;
+}
+
 /* Raw mode SERVER: count incoming raw frames (VLAN or plain) */
 static void raw_server_test(void)
 {
-    if (raw_open("127.0.0.1") != 0) {
-        /* raw_open needs a real IP; reopen with local interface IP */
-        fprintf(stderr, "Raw server: rerun with the adapter's IP, not 127.0.0.1\n");
+    if (raw_open_first_device() != 0) {
         return;
     }
 
