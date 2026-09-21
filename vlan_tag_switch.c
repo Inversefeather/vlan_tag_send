@@ -58,7 +58,7 @@ typedef unsigned long  u_long;
 #define DEFAULT_PORT        9999
 #define DEFAULT_DURATION    10
 #define DEFAULT_BUFSIZE_TCP 65536   /* Large buffer = fewer syscalls for TCP */
-#define DEFAULT_BUFSIZE_UDP 1400    /* Standard MTU-sized for UDP */
+#define DEFAULT_BUFSIZE_UDP 1472    /* Max unfragmented UDP: 1500 - 20 IP - 8 UDP */
 #define DEFAULT_INTERVAL    1
 #define MAX_BUFSIZE         65536
 
