@@ -1439,6 +1439,7 @@ static void raw_server_test(void)
 
     printf("Raw server: listening for frames%s\n",
            g_vlan_id > 0 ? " (VLAN tag expected)" : "");
+    printf("NOTE: receive-only. Source addresses are forged; server cannot echo back.\n");
     printf("[ ID] Interval           Transfer     Bandwidth\n");
 
     uint64_t total_recv = 0;
@@ -1763,6 +1764,12 @@ int main(int argc, char *argv[])
                 g_port = port;
             }
         }
+    }
+
+    /* Raw mode only supports UDP (TCP handshake not feasible with raw frames) */
+    if (g_use_raw && g_protocol == PROTO_TCP) {
+        printf("NOTE: raw mode uses UDP only (manual TCP handshake not implemented). Forcing UDP.\n\n");
+        g_protocol = PROTO_UDP;
     }
 
     /* Set Ctrl+C handler */
