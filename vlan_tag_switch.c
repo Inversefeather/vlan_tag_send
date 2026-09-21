@@ -92,8 +92,58 @@ typedef unsigned long  u_long;
 #define ARP_TIMEOUT_MS   3000
 #endif
 
-/* Global state */
-static int g_running = 1;
+#ifdef USE_WINPCAP
+/* Ethernet header */
+typedef struct eth_header_s {
+    uint8_t  dst[6];
+    uint8_t  src[6];
+    uint16_t ethertype;
+} eth_header_t;
+
+/* IPv4 header (no options) */
+typedef struct ip_header_s {
+    uint8_t  ver_ihl;       /* version << 4 | ihl */
+    uint8_t  tos;
+    uint16_t total_len;
+    uint16_t id;
+    uint16_t frag_off;
+    uint8_t  ttl;
+    uint8_t  protocol;
+    uint16_t checksum;
+    uint8_t  src[4];
+    uint8_t  dst[4];
+} ip_header_t;
+
+/* UDP header */
+typedef struct udp_header_s {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint16_t len;
+    uint16_t checksum;
+} udp_header_t;
+
+/* ARP header */
+typedef struct arp_header_s {
+    uint16_t hw_type;
+    uint16_t proto_type;
+    uint8_t  hw_len;
+    uint8_t  proto_len;
+    uint16_t opcode;
+    uint8_t  src_mac[6];
+    uint8_t  src_ip[4];
+    uint8_t  dst_mac[6];
+    uint8_t  dst_ip[4];
+} arp_header_t;
+
+#define RAW_MAX_PAYLOAD   1472   /* 1500 - 20 IP - 8 UDP (no VLAN) */
+#define RAW_FRAME_SIZE    (ETH_HDR_LEN + 4 + IP_HDR_LEN + UDP_HDR_LEN + RAW_MAX_PAYLOAD)
+
+static uint8_t  g_raw_frame[RAW_FRAME_SIZE];   /* static: must NOT be on stack */
+static int      g_raw_payload_len = RAW_MAX_PAYLOAD;
+#endif
+
+/* Thread-safe stop flag (ctrl_handler runs on a dedicated system thread) */
+static LONG g_stop = 0;
 static int g_mode = MODE_NONE;
 static int g_protocol = PROTO_TCP;
 static int g_port = DEFAULT_PORT;
@@ -125,7 +175,10 @@ static uint8_t g_pcp = 0;
 static BOOL WINAPI ctrl_handler(DWORD ctrl_type)
 {
     if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT) {
-        g_running = 0;
+        InterlockedExchange(&g_stop, 1);
+#ifdef USE_WINPCAP
+        if (g_handle) pcap_breakloop(g_handle);
+#endif
         return TRUE;
     }
     return FALSE;
@@ -239,7 +292,7 @@ static void tcp_client_test(void)
     QueryPerformanceCounter(&start);
     QueryPerformanceCounter(&interval_start);
 
-    while (g_running) {
+    while (!g_stop) {
         QueryPerformanceCounter(&now);
         double elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
 
@@ -287,7 +340,7 @@ static void tcp_client_test(void)
         /* Pacing: busy-wait until time to send more data */
         if (g_target_bps > 0) {
             double should_have_sent = (double)total_sent * 8.0 / g_target_bps;
-            while (g_running) {
+            while (!g_stop) {
                 QueryPerformanceCounter(&now);
                 double elapsed_now = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
                 if (elapsed_now >= should_have_sent) break;
@@ -392,7 +445,7 @@ static void tcp_server_test(void)
     QueryPerformanceCounter(&start);
     QueryPerformanceCounter(&interval_start);
 
-    while (g_running) {
+    while (!g_stop) {
         int received = recv(client_sock, (char *)buf, g_bufsize, 0);
         QueryPerformanceCounter(&now);
 
@@ -506,7 +559,7 @@ static void udp_client_test(void)
      * If total_sent >= should_send → we're ahead, yield briefly.
      * No Sleep(1) bottleneck: Sleep(0) yields without the ~15ms timer granularity.
      */
-    while (g_running) {
+    while (!g_stop) {
         QueryPerformanceCounter(&now);
         double elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
 
@@ -533,12 +586,12 @@ static void udp_client_test(void)
                 int err = WSAGetLastError();
                 if (err == WSAEWOULDBLOCK) {
                     /* Socket buffer full — brief busy-wait then retry */
-                    for (int spin = 0; spin < 100 && g_running; spin++)
+                    for (int spin = 0; spin < 100 && !g_stop; spin++)
                         YieldProcessor();
                     continue;
                 }
                 fprintf(stderr, "\nError: sendto() failed: %d\n", err);
-                g_running = 0;
+                InterlockedExchange(&g_stop, 1);
                 break;
             }
 
@@ -646,7 +699,7 @@ static void udp_server_test(void)
     int has_client = 0;
     int silence_ms = g_silence_timeout * 1000;
 
-    while (g_running) {
+    while (!g_stop) {
         /* Set recv timeout for silence detection */
         DWORD timeout = 100;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
@@ -763,7 +816,7 @@ static void server_interactive_loop(void)
     u_long nonblock = 1;
     ioctlsocket(listen_sock, FIONBIO, &nonblock);
 
-    while (g_running) {
+    while (!g_stop) {
         /* Try to accept client */
         if (!has_client) {
             addr_len = sizeof(client_addr);
@@ -866,7 +919,7 @@ static void client_interactive_loop(void)
     u_long nonblock = 1;
     ioctlsocket(sock, FIONBIO, &nonblock);
 
-    while (g_running) {
+    while (!g_stop) {
         int received = recv(sock, (char *)buf, sizeof(buf) - 1, 0);
         if (received > 0) {
             buf[received] = '\0';
