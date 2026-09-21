@@ -966,15 +966,561 @@ static void client_interactive_loop(void)
     closesocket(sock);
 }
 
+#ifdef USE_WINPCAP
 /*=======================================================================
- * Raw mode (WinPcap) - VLAN tag support
- *
- * NOTE: Raw mode is not implemented in this version.
- * Use socket mode for bandwidth testing (works like iperf).
- * For VLAN tag testing, use standard iperf3 with VLAN interfaces:
- *   1. Configure VLAN interfaces at the OS level
- *   2. Use: iperf3 -c <vlan_ip> -p <port> -b <bw>
+ * Raw mode (WinPcap/Npcap) - VLAN tagged traffic generator
+ * Sends forged raw Ethernet frames: Eth | VLAN | IP | UDP | payload
+ * NOTE: no kernel callbacks, no Npcap timer storm -> no BSOD path.
  *=====================================================================*/
+
+/* One's complement checksum (RFC 1071) */
+static uint16_t raw_checksum(const void *data, int len)
+{
+    const uint16_t *p = (const uint16_t *)data;
+    uint32_t sum = 0;
+    int words = len >> 1;
+
+    for (int i = 0; i < words; i++) {
+        sum += p[i];
+        if (sum & 0xFFFF0000) {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+    }
+    if (len & 1)
+        sum += (uint16_t)(*((const uint8_t *)data + len - 1) << 8);
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+
+    return (uint16_t)(~sum & 0xFFFF);
+}
+
+/* UDP pseudo-header checksum */
+static uint16_t raw_udp_checksum(const uint8_t *src_ip, const uint8_t *dst_ip,
+                                 const void *udp_hdr, int udp_len)
+{
+    uint16_t *udp16 = (uint16_t *)udp_hdr;
+    uint32_t sum = 0;
+
+    /* pseudo-header */
+    for (int i = 0; i < 4; i += 2)
+        sum += ((uint16_t)src_ip[i] << 8) | src_ip[i + 1];
+    for (int i = 0; i < 4; i += 2)
+        sum += ((uint16_t)dst_ip[i] << 8) | dst_ip[i + 1];
+    sum += IP_PROTOCOL_UDP;
+    sum += (uint16_t)udp_len;
+
+    /* UDP header + payload, padded to even length */
+    int even_len = (udp_len + 1) & ~1;
+    uint8_t *tmp = (uint8_t *)malloc(even_len);
+    if (!tmp) return 0;
+    memcpy(tmp, udp_hdr, udp_len);
+    tmp[udp_len] = 0;
+
+    for (int i = 0; i < even_len; i += 2) {
+        sum += ((uint16_t)tmp[i] << 8) | tmp[i + 1];
+        if (sum & 0xFFFF0000)
+            sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    free(tmp);
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+
+    uint16_t c = (uint16_t)(~sum & 0xFFFF);
+    return c ? c : 0xFFFF;   /* checksum 0x0000 must be sent as 0xFFFF */
+}
+
+/*
+ * Maximum payload that fits in one untagged Ethernet frame.
+ * VLAN mode: 4 bytes less (VLAN tag sits inside the Ethernet header).
+ */
+static int raw_max_payload(void)
+{
+    int payload = 1500 - IP_HDR_LEN - UDP_HDR_LEN;
+    if (g_vlan_id > 0)
+        payload -= VLAN_TAG_LEN;
+    return payload;           /* 1472 untagged / 1468 tagged */
+}
+
+/*
+ * Build one raw frame.
+ * Layout (tagged): DMAC(6) | SMAC(6) | TPID 8100(2) | TCI(2) | EtherType 0800(2)
+ *                  | IP(20) | UDP(8) | payload
+ */
+static int raw_build_frame(const uint8_t *dst_mac, const uint8_t *src_mac,
+                           const uint8_t *dst_ip, const uint8_t *src_ip,
+                           uint16_t sport, uint16_t dport,
+                           const void *payload, int payload_len,
+                           uint8_t *out, int *out_len)
+{
+    const int max_pl = raw_max_payload();
+    if (payload_len < 0 || payload_len > max_pl) {
+        fprintf(stderr, "Error: payload %d exceeds %d bytes (one frame, no fragmentation)\n",
+                payload_len, max_pl);
+        return -1;
+    }
+
+    eth_header_t *eth = (eth_header_t *)out;
+    memcpy(eth->dst, dst_mac, 6);
+    memcpy(eth->src, src_mac, 6);
+
+    uint8_t *p = out + ETH_HDR_LEN;
+    int eth_payload_off;
+
+    if (g_vlan_id > 0) {
+        *((uint16_t *)(p + 0)) = htons(ETHERTYPE_VLAN);          /* TPID */
+        *((uint16_t *)(p + 2)) = htons(((uint16_t)(g_pcp & 7) << VLAN_PCP_SHIFT)
+                                       | (g_vlan_id & VLAN_VID_MASK));  /* TCI */
+        *((uint16_t *)(p + 4)) = htons(ETHERTYPE_IP);            /* inner type */
+        eth_payload_off = ETH_HDR_LEN + VLAN_TAG_LEN;
+    } else {
+        eth->ethertype = htons(ETHERTYPE_IP);
+        eth_payload_off = ETH_HDR_LEN;
+    }
+
+    ip_header_t *ip = (ip_header_t *)(out + eth_payload_off);
+    memset(ip, 0, sizeof(*ip));
+    ip->ver_ihl    = 0x45;
+    ip->tos        = 0;
+    ip->total_len  = htons(sizeof(ip_header_t) + UDP_HDR_LEN + payload_len);
+    ip->id         = htons((uint16_t)(GetTickCount() & 0xFFFF));
+    ip->frag_off   = 0;
+    ip->ttl        = 64;
+    ip->protocol   = IP_PROTOCOL_UDP;
+    memcpy(ip->src, src_ip, 4);
+    memcpy(ip->dst, dst_ip, 4);
+    ip->checksum   = raw_checksum(ip, sizeof(*ip));
+
+    udp_header_t *udp = (udp_header_t *)((uint8_t *)ip + sizeof(*ip));
+    udp->src_port = htons(sport);
+    udp->dst_port = htons(dport);
+    udp->len      = htons((uint16_t)(UDP_HDR_LEN + payload_len));
+    udp->checksum = 0;
+
+    if (payload && payload_len > 0)
+        memcpy((uint8_t *)udp + UDP_HDR_LEN, payload, payload_len);
+
+    udp->checksum = raw_udp_checksum(src_ip, dst_ip, udp, UDP_HDR_LEN + payload_len);
+
+    *out_len = eth_payload_off + sizeof(*ip) + UDP_HDR_LEN + payload_len;
+    return 0;
+}
+
+/* Find the pcap device whose IPv4 address matches target_ip */
+static int raw_find_device(const char *target_ip, char *dev_buf, int dev_buf_len)
+{
+    pcap_if_t *alldevs = NULL, *d;
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+        fprintf(stderr, "Error: pcap_findalldevs: %s\n", errbuf);
+        return -1;
+    }
+
+    struct in_addr target;
+    if (inet_pton(AF_INET, target_ip, &target) != 1) {
+        fprintf(stderr, "Error: cannot parse IP %s\n", target_ip);
+        pcap_freealldevs(alldevs);
+        return -1;
+    }
+
+    int found = 0;
+    for (d = alldevs; d; d = d->next) {
+        pcap_addr_t *a;
+        for (a = d->addresses; a; a = a->next) {
+            if (!a->addr || a->addr->sa_family != AF_INET) continue;
+            struct sockaddr_in *s = (struct sockaddr_in *)a->addr;
+            if (s->sin_addr.s_addr == target.s_addr) {
+                found = 1;
+                break;
+            }
+        }
+        if (found) break;
+    }
+
+    if (found) {
+        snprintf(dev_buf, dev_buf_len, "%s", d->name);
+    } else {
+        /* fallback: first device with any IPv4 address */
+        for (d = alldevs; d; d = d->next) {
+            for (pcap_addr_t *a = d->addresses; a; a = a->next) {
+                if (a->addr && a->addr->sa_family == AF_INET) {
+                    snprintf(dev_buf, dev_buf_len, "%s", d->name);
+                    found = 1;
+                    goto out;
+                }
+            }
+        }
+    }
+out:
+    pcap_freealldevs(alldevs);
+    return found ? 0 : -1;
+}
+
+/* Open the adapter and learn our own MAC + IP */
+static int raw_open(const char *target_ip)
+{
+    char dev_name[1024];
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    if (raw_find_device(target_ip, dev_name, sizeof(dev_name)) != 0) {
+        fprintf(stderr, "Error: no suitable pcap device for %s\n", target_ip);
+        return -1;
+    }
+
+    /*
+     * timeout = 100 ms (NOT 1 ms).
+     * 1 ms makes Npcap's internal timer fire continuously and is the
+     * classic BSOD trigger on Windows 7 x64.
+     */
+    g_handle = pcap_open_live(dev_name, 65536, 1, 100, errbuf);
+    if (!g_handle) {
+        fprintf(stderr, "Error: pcap_open_live(%s) failed: %s\n", dev_name, errbuf);
+        return -1;
+    }
+
+    if (pcap_datalink(g_handle) != DLT_EN10MB) {
+        fprintf(stderr, "Error: not an Ethernet adapter\n");
+        return -1;
+    }
+
+    /* Pull MAC + IP from pcap device info */
+    pcap_if_t *alldevs = NULL;
+    pcap_addr_t *a;
+    uint8_t *mac = NULL;
+    uint8_t *ip  = NULL;
+    if (pcap_findalldevs(&alldevs, errbuf) == 0) {
+        for (pcap_if_t *d = alldevs; d; d = d->next) {
+            if (strcmp(d->name, dev_name) != 0) continue;
+            if (d->flags & PCAP_IF_LOOPBACK) {
+                fprintf(stderr, "Error: %s is a loopback device, raw frames not supported\n",
+                        dev_name);
+                pcap_freealldevs(alldevs);
+                return -1;
+            }
+            for (a = d->addresses; a; a = a->next) {
+                if (!a->addr || a->addr->sa_family != AF_INET) continue;
+                struct sockaddr_in *s = (struct sockaddr_in *)a->addr;
+                memcpy(g_my_ip, &s->sin_addr.s_addr, 4);
+                ip = g_my_ip;
+
+                /* MAC lives in ->addr of AF_PACKET on WinPcap, else get it via GetAdaptersInfo */
+                if (a->addr && a->addr->sa_family == AF_INET) {
+                    /* not available here on Windows; fetch below */
+                }
+            }
+        }
+        pcap_freealldevs(alldevs);
+    }
+
+    /* Get MAC via IP Helper API */
+    {
+        IP_ADAPTER_INFO *info = NULL, *p;
+        ULONG buf_len = 0;
+        if (GetAdaptersInfo(NULL, &buf_len) == ERROR_BUFFER_OVERFLOW) {
+            info = (IP_ADAPTER_INFO *)malloc(buf_len);
+            if (info && GetAdaptersInfo(info, &buf_len) == NO_ERROR) {
+                for (p = info; p; p = p->Next) {
+                    struct in_addr ia;
+                    ia.s_addr = *(uint32_t *)&p->IpAddressList.IpAddress.String;
+                    /* compare as uint32 */
+                    uint32_t have = *(uint32_t *)g_my_ip;
+                    if (have != 0 && memcmp(&ia.s_addr, g_my_ip, 4) == 0) {
+                        for (int i = 0; i < 6; i++)
+                            g_my_mac[i] = (uint8_t)p->Address[i];
+                        mac = g_my_mac;
+                        break;
+                    }
+                }
+            }
+            free(info);
+        }
+    }
+
+    if (!mac || memcmp(g_my_mac, "\x00\x00\x00\x00\x00\x00", 6) == 0) {
+        fprintf(stderr, "Error: cannot determine local MAC for %s\n", dev_name);
+        return -1;
+    }
+    if (!ip || *(uint32_t *)g_my_ip == 0) {
+        fprintf(stderr, "Error: %s has no IPv4 address configured\n", dev_name);
+        return -1;
+    }
+
+    printf("Raw mode: device=%s MAC=%02X:%02X:%02X:%02X:%02X:%02X IP=%u.%u.%u.%u\n",
+           dev_name,
+           g_my_mac[0], g_my_mac[1], g_my_mac[2],
+           g_my_mac[3], g_my_mac[4], g_my_mac[5],
+           g_my_ip[0], g_my_ip[1], g_my_ip[2], g_my_ip[3]);
+
+    return 0;
+}
+
+/* Resolve dst_ip -> dst_mac via ARP */
+static int raw_arp_resolve(const uint8_t *dst_ip, uint8_t *dst_mac)
+{
+    uint8_t req[42];
+    eth_header_t *eth = (eth_header_t *)req;
+    memset(eth->dst, 0xFF, 6);
+    memcpy(eth->src, g_my_mac, 6);
+    eth->ethertype = htons(ETHERTYPE_ARP);
+
+    arp_header_t *arp = (arp_header_t *)(req + ETH_HDR_LEN);
+    arp->hw_type   = htons(ARP_HW_TYPE_ETH);
+    arp->proto_type = htons(ETHERTYPE_IP);
+    arp->hw_len    = 6;
+    arp->proto_len = 4;
+    arp->opcode    = htons(ARP_OP_REQUEST);
+    memcpy(arp->src_mac, g_my_mac, 6);
+    memcpy(arp->src_ip, g_my_ip, 4);
+    memset(arp->dst_mac, 0x00, 6);
+    memcpy(arp->dst_ip, dst_ip, 4);
+
+    if (pcap_sendpacket(g_handle, req, sizeof(req)) != 0) {
+        fprintf(stderr, "Error: ARP request send failed: %s\n", pcap_geterr(g_handle));
+        return -1;
+    }
+    printf("ARP request sent for %u.%u.%u.%u, waiting %d ms...\n",
+           dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], ARP_TIMEOUT_MS);
+
+    int deadline = GetTickCount() + ARP_TIMEOUT_MS;
+    struct pcap_pkthdr *hdr;
+    const uint8_t *pkt;
+
+    while ((int)(GetTickCount() - deadline) < 0 && !g_stop) {
+        int r = pcap_next_ex(g_handle, &hdr, &pkt);
+        if (r == 1 && hdr->len >= 42) {
+            eth = (eth_header_t *)pkt;
+            if (ntohs(eth->ethertype) != ETHERTYPE_ARP) continue;
+            arp = (arp_header_t *)(pkt + ETH_HDR_LEN);
+            if (ntohs(arp->opcode) != ARP_OP_REPLY) continue;
+            if (memcmp(arp->src_ip, dst_ip, 4) != 0) continue;
+            memcpy(dst_mac, arp->src_mac, 6);
+            printf("ARP resolved: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                   dst_mac[0], dst_mac[1], dst_mac[2],
+                   dst_mac[3], dst_mac[4], dst_mac[5]);
+            return 0;
+        } else if (r == -1) {
+            fprintf(stderr, "Error: pcap_next_ex: %s\n", pcap_geterr(g_handle));
+            return -1;
+        }
+    }
+    fprintf(stderr, "Error: ARP timeout (target not on local link?)\n");
+    return -1;
+}
+
+/* Raw mode CLIENT: blast VLAN/UDP frames */
+static void raw_client_test(void)
+{
+    if (raw_open(g_server_ip) != 0) return;
+
+    memcpy(g_peer_ip, g_my_ip, 4);   /* keep own IP */
+    /* peer = target host parsed from g_server_ip */
+    struct in_addr ia;
+    if (inet_pton(AF_INET, g_server_ip, &ia) == 1)
+        memcpy(g_peer_ip, &ia.s_addr, 4);
+
+    if (raw_arp_resolve(g_peer_ip, g_peer_mac) != 0) {
+        pcap_close(g_handle);
+        g_handle = NULL;
+        return;
+    }
+
+    /* payload content (static buffer, survives the call) */
+    g_raw_payload_len = raw_max_payload();
+    if (g_bufsize > 0 && g_bufsize <= g_raw_payload_len)
+        g_raw_payload_len = g_bufsize;
+    uint8_t *payload = (uint8_t *)malloc(g_raw_payload_len);
+    if (!payload) {
+        fprintf(stderr, "Error: malloc payload failed\n");
+        pcap_close(g_handle);
+        g_handle = NULL;
+        return;
+    }
+    for (int i = 0; i < g_raw_payload_len; i++)
+        payload[i] = (uint8_t)(i & 0xFF);
+
+    int frame_len = 0;
+    if (raw_build_frame(g_peer_mac, g_my_mac, g_peer_ip, g_my_ip,
+                        5001, (uint16_t)g_port,
+                        payload, g_raw_payload_len,
+                        g_raw_frame, &frame_len) != 0) {
+        free(payload);
+        pcap_close(g_handle);
+        g_handle = NULL;
+        return;
+    }
+
+    printf("Raw client: VLAN %u PCP %u payload %d bytes target %s\n",
+           g_vlan_id, g_pcp,
+           g_raw_payload_len,
+           g_target_bps > 0 ? "" : "(unlimited)");
+    if (g_target_bps > 0) {
+        char bw_str[32];
+        format_bps(g_target_bps, bw_str, sizeof(bw_str));
+        printf("Target BW: %s\n", bw_str);
+    }
+    printf("[ ID] Interval           Transfer     Bandwidth\n");
+
+    uint64_t total_sent = 0;
+    uint64_t interval_sent = 0;
+    LARGE_INTEGER freq, start, interval_start, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    QueryPerformanceCounter(&interval_start);
+
+    while (!g_stop) {
+        QueryPerformanceCounter(&now);
+        double elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
+
+        if (g_nbytes > 0) {
+            if (total_sent >= g_nbytes) break;
+        } else {
+            if (elapsed_sec >= g_duration) break;
+        }
+
+        if (pcap_sendpacket(g_handle, g_raw_frame, frame_len) != 0) {
+            fprintf(stderr, "\nError: pcap_sendpacket: %s\n", pcap_geterr(g_handle));
+            break;
+        }
+        total_sent += g_raw_payload_len;
+        interval_sent += g_raw_payload_len;
+
+        /* pacing */
+        if (g_target_bps > 0) {
+            double should_send = elapsed_sec * (g_target_bps / 8.0);
+            if ((double)total_sent >= should_send) {
+                /* ahead -> short yield, do NOT Sleep(1) */
+                for (int spin = 0; spin < 50 && !g_stop; spin++)
+                    YieldProcessor();
+            }
+        }
+
+        QueryPerformanceCounter(&now);
+        double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
+        if (interval_sec >= g_report_interval) {
+            double bps = (double)interval_sent * 8 / interval_sec;
+            double start_sec = (double)(interval_start.QuadPart - start.QuadPart) / freq.QuadPart;
+            char bw_str[32], bytes_str[32];
+            format_bps(bps, bw_str, sizeof(bw_str));
+            format_bytes(interval_sent, bytes_str, sizeof(bytes_str));
+            printf("[  1] %5.2f-%5.2f sec  %s  %s\n",
+                   start_sec, start_sec + interval_sec, bytes_str, bw_str);
+            interval_sent = 0;
+            interval_start = now;
+            fflush(stdout);
+        }
+    }
+
+    QueryPerformanceCounter(&now);
+    double total_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
+    double avg_bps = (total_sec > 0) ? (double)total_sent * 8 / total_sec : 0;
+    char bw_str[32], bytes_str[32];
+    format_bps(avg_bps, bw_str, sizeof(bw_str));
+    format_bytes(total_sent, bytes_str, sizeof(bytes_str));
+    printf("\n- - - - - - - - - - - - - - - - - - - - - - - - -\n");
+    printf("[  1]  0.00-%5.2f sec  %s  %s                  sender\n",
+           total_sec, bytes_str, bw_str);
+    printf("Sent %llu bytes in %.2f seconds\n",
+           (unsigned long long)total_sent, total_sec);
+
+    free(payload);
+    pcap_close(g_handle);
+    g_handle = NULL;
+}
+
+/* Raw mode SERVER: count incoming raw frames (VLAN or plain) */
+static void raw_server_test(void)
+{
+    if (raw_open("127.0.0.1") != 0) {
+        /* raw_open needs a real IP; reopen with local interface IP */
+        fprintf(stderr, "Raw server: rerun with the adapter's IP, not 127.0.0.1\n");
+        return;
+    }
+
+    printf("Raw server: listening for frames%s\n",
+           g_vlan_id > 0 ? " (VLAN tag expected)" : "");
+    printf("[ ID] Interval           Transfer     Bandwidth\n");
+
+    uint64_t total_recv = 0;
+    uint64_t interval_recv = 0;
+    LARGE_INTEGER freq, start, interval_start, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    QueryPerformanceCounter(&interval_start);
+    int deadline = GetTickCount() + g_silence_timeout * 1000;
+
+    while (!g_stop) {
+        struct pcap_pkthdr *hdr;
+        const uint8_t *pkt;
+        int r = pcap_next_ex(g_handle, &hdr, &pkt);
+
+        if (r == 1 && hdr->len >= ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN) {
+            eth_header_t *eth = (eth_header_t *)pkt;
+            uint16_t et = ntohs(eth->ethertype);
+            uint8_t *ip_pkt;
+
+            if (et == ETHERTYPE_VLAN) {
+                if (g_vlan_id == 0 || hdr->len < VLAN_ETH_HDR_LEN + IP_HDR_LEN) continue;
+                uint16_t tci = ntohs(*(uint16_t *)(pkt + ETH_HDR_LEN + 2));
+                if ((tci & VLAN_VID_MASK) != g_vlan_id) continue;
+                ip_pkt = (uint8_t *)eth + VLAN_ETH_HDR_LEN;
+            } else if (et == ETHERTYPE_IP) {
+                if (g_vlan_id > 0) continue;   /* strict: expect tagged */
+                ip_pkt = (uint8_t *)eth + ETH_HDR_LEN;
+            } else {
+                continue;
+            }
+
+            ip_header_t *ip = (ip_header_t *)ip_pkt;
+            if (ip->protocol != IP_PROTOCOL_UDP) continue;
+            udp_header_t *udp = (udp_header_t *)(ip_pkt + IP_HDR_LEN);
+            if (ntohs(udp->dst_port) != (uint16_t)g_port) continue;
+
+            int plen = ntohs(ip->total_len) - IP_HDR_LEN - UDP_HDR_LEN;
+            total_recv += (plen > 0) ? plen : 0;
+            interval_recv += (plen > 0) ? plen : 0;
+            deadline = GetTickCount() + g_silence_timeout * 1000;
+
+            QueryPerformanceCounter(&now);
+            double interval_sec = (double)(now.QuadPart - interval_start.QuadPart) / freq.QuadPart;
+            if (interval_sec >= g_report_interval && interval_recv > 0) {
+                double bps = (double)interval_recv * 8 / interval_sec;
+                double elapsed = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
+                char bw_str[32], bytes_str[32];
+                format_bps(bps, bw_str, sizeof(bw_str));
+                format_bytes(interval_recv, bytes_str, sizeof(bytes_str));
+                printf("[  3] %5.2f-%5.2f sec  %s  %s\n",
+                       (double)(interval_start.QuadPart - start.QuadPart) / freq.QuadPart,
+                       elapsed, bytes_str, bw_str);
+                interval_recv = 0;
+                interval_start = now;
+                fflush(stdout);
+            }
+        } else if (r == -1) {
+            fprintf(stderr, "\nError: pcap_next_ex: %s\n", pcap_geterr(g_handle));
+            break;
+        }
+
+        if ((int)(GetTickCount() - deadline) >= 0) {
+            printf("\nNo frames for %d seconds, stopping.\n", g_silence_timeout);
+            break;
+        }
+    }
+
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    double total_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
+    double avg_bps = (total_sec > 0) ? (double)total_recv * 8 / total_sec : 0;
+    char bw_str[32], bytes_str[32];
+    format_bps(avg_bps, bw_str, sizeof(bw_str));
+    format_bytes(total_recv, bytes_str, sizeof(bytes_str));
+    printf("\n- - - - - - - - - - - - - - - - - - - - - - - - -\n");
+    printf("[  3]  0.00-%5.2f sec  %s  %s\n", total_sec, bytes_str, bw_str);
+
+    pcap_close(g_handle);
+    g_handle = NULL;
+}
+#endif /* USE_WINPCAP */
 
 /*=======================================================================
  * Usage
@@ -1271,12 +1817,22 @@ int main(int argc, char *argv[])
             if (g_protocol == PROTO_TCP) {
                 tcp_client_test();
             } else {
+#ifdef USE_WINPCAP
+                if (g_use_raw) {
+                    raw_client_test();
+                } else
+#endif
                 udp_client_test();
             }
         } else {
             if (g_protocol == PROTO_TCP) {
                 tcp_server_test();
             } else {
+#ifdef USE_WINPCAP
+                if (g_use_raw) {
+                    raw_server_test();
+                } else
+#endif
                 udp_server_test();
             }
         }
