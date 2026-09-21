@@ -500,6 +500,19 @@ static void udp_client_test(void)
     QueryPerformanceCounter(&start);
     QueryPerformanceCounter(&interval_start);
 
+    /* Burst pacing: calculate datagrams per burst interval */
+    /* Use 10ms burst interval for smooth pacing */
+    double burst_interval_sec = 0.01;  /* 10ms */
+    int burst_count = 1;
+    if (g_target_bps > 0) {
+        double bits_per_datagram = (double)g_bufsize * 8;
+        double datagrams_per_sec = g_target_bps / bits_per_datagram;
+        burst_count = (int)(datagrams_per_sec * burst_interval_sec);
+        if (burst_count < 1) burst_count = 1;
+        /* For very high bandwidth, limit burst to avoid buffer overflow */
+        if (burst_count > 1000) burst_count = 1000;
+    }
+
     while (g_running) {
         QueryPerformanceCounter(&now);
         double elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
@@ -510,19 +523,37 @@ static void udp_client_test(void)
             if (elapsed_sec >= g_duration) break;
         }
 
-        int to_send = g_bufsize;
-        if (g_nbytes > 0 && total_sent + to_send > g_nbytes)
-            to_send = (int)(g_nbytes - total_sent);
+        /* Send a burst of datagrams */
+        for (int i = 0; i < burst_count && g_running; i++) {
+            QueryPerformanceCounter(&now);
+            elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
 
-        int sent = sendto(sock, (char *)buf, to_send, 0,
-                          (struct sockaddr *)&addr, sizeof(addr));
-        if (sent == SOCKET_ERROR) {
-            fprintf(stderr, "\nError: sendto() failed: %d\n", WSAGetLastError());
-            break;
+            if (g_nbytes > 0) {
+                if (total_sent >= g_nbytes) break;
+            } else {
+                if (elapsed_sec >= g_duration) break;
+            }
+
+            int to_send = g_bufsize;
+            if (g_nbytes > 0 && total_sent + to_send > g_nbytes)
+                to_send = (int)(g_nbytes - total_sent);
+
+            int sent = sendto(sock, (char *)buf, to_send, 0,
+                              (struct sockaddr *)&addr, sizeof(addr));
+            if (sent == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                if (err == WSAEWOULDBLOCK) {
+                    Sleep(1);
+                    continue;
+                }
+                fprintf(stderr, "\nError: sendto() failed: %d\n", err);
+                g_running = 0;
+                break;
+            }
+
+            total_sent += sent;
+            interval_sent += sent;
         }
-
-        total_sent += sent;
-        interval_sent += sent;
 
         /* Report interval */
         QueryPerformanceCounter(&now);
@@ -540,7 +571,7 @@ static void udp_client_test(void)
             fflush(stdout);
         }
 
-        /* Pacing */
+        /* Pacing: sleep for the burst interval */
         if (g_target_bps > 0) {
             QueryPerformanceCounter(&now);
             double elapsed_now = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
