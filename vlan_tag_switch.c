@@ -999,7 +999,6 @@ static uint16_t raw_checksum(const void *data, int len)
 static uint16_t raw_udp_checksum(const uint8_t *src_ip, const uint8_t *dst_ip,
                                  const void *udp_hdr, int udp_len)
 {
-    uint16_t *udp16 = (uint16_t *)udp_hdr;
     uint32_t sum = 0;
 
     /* pseudo-header */
