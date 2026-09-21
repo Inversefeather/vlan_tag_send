@@ -500,14 +500,12 @@ static void udp_client_test(void)
     QueryPerformanceCounter(&start);
     QueryPerformanceCounter(&interval_start);
 
-    /* Token bucket pacing:
-     * We track how many bytes we SHOULD have sent (token_bytes).
-     * Send a datagram only when tokens are available.
-     * This gives accurate pacing without relying on Sleep() resolution.
+    /*
+     * Pacing: track cumulative bytes we SHOULD have sent by now.
+     * If total_sent < should_send → we're behind, send immediately.
+     * If total_sent >= should_send → we're ahead, yield briefly.
+     * No Sleep(1) bottleneck: Sleep(0) yields without the ~15ms timer granularity.
      */
-    double token_bytes = 0;  /* Bytes we're allowed to send */
-    int64_t max_token_bytes = (int64_t)g_bufsize * 10;  /* Max burst size */
-
     while (g_running) {
         QueryPerformanceCounter(&now);
         double elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
@@ -518,32 +516,13 @@ static void udp_client_test(void)
             if (elapsed_sec >= g_duration) break;
         }
 
-        /* Replenish tokens based on elapsed time */
-        if (g_target_bps > 0) {
-            token_bytes = elapsed_sec * (g_target_bps / 8.0);
-            if (token_bytes > max_token_bytes) token_bytes = max_token_bytes;
-        } else {
-            token_bytes = g_bufsize;  /* Unlimited: always send */
-        }
+        /* How many bytes should we have sent by now? */
+        double should_send = (g_target_bps > 0)
+            ? elapsed_sec * (g_target_bps / 8.0)
+            : (double)UINT64_MAX;  /* unlimited */
 
-        /* Send datagrams while we have tokens */
-        while (token_bytes >= g_bufsize && g_running) {
-            QueryPerformanceCounter(&now);
-            elapsed_sec = (double)(now.QuadPart - start.QuadPart) / freq.QuadPart;
-
-            if (g_nbytes > 0) {
-                if (total_sent >= g_nbytes) break;
-            } else {
-                if (elapsed_sec >= g_duration) break;
-            }
-
-            /* Replenish tokens */
-            if (g_target_bps > 0) {
-                token_bytes = elapsed_sec * (g_target_bps / 8.0);
-                if (token_bytes > max_token_bytes) token_bytes = max_token_bytes;
-                if (token_bytes < g_bufsize) break;  /* Not enough tokens */
-            }
-
+        if (total_sent < should_send) {
+            /* Behind schedule — send a datagram */
             int to_send = g_bufsize;
             if (g_nbytes > 0 && total_sent + to_send > g_nbytes)
                 to_send = (int)(g_nbytes - total_sent);
@@ -553,7 +532,12 @@ static void udp_client_test(void)
             if (sent == SOCKET_ERROR) {
                 int err = WSAGetLastError();
                 if (err == WSAEWOULDBLOCK) {
-                    Sleep(1);
+                    /* Socket buffer full — wait with select() */
+                    fd_set writefds;
+                    FD_ZERO(&writefds);
+                    FD_SET(sock, &writefds);
+                    struct timeval tv = {0, 100};  /* 100µs */
+                    select(0, NULL, &writefds, NULL, &tv);
                     continue;
                 }
                 fprintf(stderr, "\nError: sendto() failed: %d\n", err);
@@ -563,7 +547,9 @@ static void udp_client_test(void)
 
             total_sent += sent;
             interval_sent += sent;
-            token_bytes -= sent;
+        } else {
+            /* Ahead of schedule — yield CPU, don't burn 15ms on Sleep(1) */
+            Sleep(0);
         }
 
         /* Report interval */
@@ -580,11 +566,6 @@ static void udp_client_test(void)
             interval_sent = 0;
             interval_start = now;
             fflush(stdout);
-        }
-
-        /* Sleep to wait for more tokens (1ms is minimum Sleep resolution) */
-        if (g_target_bps > 0 && g_running) {
-            Sleep(1);
         }
     }
 
