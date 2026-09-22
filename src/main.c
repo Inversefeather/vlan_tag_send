@@ -231,8 +231,15 @@ static int resolve_arp(uint32_t local_ip, uint32_t remote_ip, uint8_t *peer_mac,
         int r = pcap_next_ex(arp_pcap, &hdr, &pkt);
         if (r == 1 && hdr->len >= 42) {
             eth_header_t *re = (eth_header_t *)pkt;
-            if (ntohs(re->ethertype) != ETHERTYPE_ARP) continue;
-            uint8_t *ra = (uint8_t *)pkt + ETH_HDR_LEN;
+            uint16_t et = ntohs(re->ethertype);
+            const uint8_t *ra = (uint8_t *)pkt + ETH_HDR_LEN;
+            /* skip VLAN tag if present */
+            if (et == ETHERTYPE_VLAN) {
+                if (hdr->len < ETH_HDR_LEN + VLAN_TAG_LEN + 28) continue;
+                et = (uint16_t)((pkt[ETH_HDR_LEN + 2] << 8) | pkt[ETH_HDR_LEN + 3]);
+                ra = (uint8_t *)pkt + ETH_HDR_LEN + VLAN_TAG_LEN;
+            }
+            if (et != ETHERTYPE_ARP) continue;
             if (ra[6]||ra[7]!=2) continue;
             uint32_t sip; memcpy(&sip, ra+14, 4);
             if (sip != remote_ip) continue;
@@ -243,7 +250,10 @@ static int resolve_arp(uint32_t local_ip, uint32_t remote_ip, uint8_t *peer_mac,
         }
     }
     pcap_close(arp_pcap);
-    return (memcmp(peer_mac, "\x00\x00\x00\x00\x00\x00", 6) != 0) ? 0 : -1;
+    {
+        uint8_t zero_mac[6] = {0};
+        return (memcmp(peer_mac, zero_mac, 6) != 0) ? 0 : -1;
+    }
 }
 
 /* ---------------------------------------------------------------------

@@ -232,8 +232,15 @@ static int arp_resolve(uint32_t my_ip, uint32_t peer_ip, uint8_t *peer_mac,
         int r = pcap_next_ex(g_pcap, &hdr, &pkt);
         if (r == 1 && hdr->len >= 42) {
             eth_header_t *re = (eth_header_t *)pkt;
-            if (ntohs(re->ethertype) != ETHERTYPE_ARP) continue;
-            uint8_t *ra = (uint8_t *)pkt + ETH_HDR_LEN;
+            uint16_t et = ntohs(re->ethertype);
+            const uint8_t *ra = (uint8_t *)pkt + ETH_HDR_LEN;
+            /* skip VLAN tag if present */
+            if (et == ETHERTYPE_VLAN) {
+                if (hdr->len < ETH_HDR_LEN + VLAN_TAG_LEN + 28) continue;
+                et = (uint16_t)((pkt[ETH_HDR_LEN + 2] << 8) | pkt[ETH_HDR_LEN + 3]);
+                ra = (uint8_t *)pkt + ETH_HDR_LEN + VLAN_TAG_LEN;
+            }
+            if (et != ETHERTYPE_ARP) continue;
             if (ra[6] || ra[7] != 2) continue;   /* not a reply */
             uint32_t sip; memcpy(&sip, ra + 14, 4);
             if (sip != peer_ip) continue;
@@ -273,16 +280,19 @@ static uint8_t *eth_build_with_vlan(uint8_t *p, const uint8_t *dst, const uint8_
     eth_header_t *eth = (eth_header_t *)p;
     memcpy(eth->dst, dst, 6);
     memcpy(eth->src, src, 6);
-    eth->ethertype = htons(ETHERTYPE_VLAN);
-    p += ETH_HDR_LEN;
+    eth->ethertype = htons(ETHERTYPE_VLAN);  /* offset 12-13: TPID 0x8100 */
+    p += ETH_HDR_LEN;                         /* p -> offset 14 */
 
-    /* TPID 0x8100 */
-    p[0] = 0x81; p[1] = 0x00;
+    /* TCI (2 bytes) at offset 14-15 */
     uint16_t tci = (uint16_t)(((vlan_pcp & 7) << VLAN_PCP_SHIFT)
                               | (vlan_id & VLAN_VID_MASK));
-    p[2] = (uint8_t)(tci >> 8);
-    p[3] = (uint8_t)(tci & 0xFF);
-    return p + VLAN_TAG_LEN;
+    p[0] = (uint8_t)(tci >> 8);
+    p[1] = (uint8_t)(tci & 0xFF);
+
+    /* Inner EtherType = IPv4 (2 bytes) at offset 16-17 */
+    p[2] = 0x08; p[3] = 0x00;
+
+    return p + VLAN_TAG_LEN;  /* VLAN_TAG_LEN=4: TCI(2)+EtherType(2) -> offset 18 */
 }
 
 /* ---------------------------------------------------------------------

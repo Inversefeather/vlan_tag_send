@@ -502,9 +502,16 @@ void tcp_fsm_input(const parsed_tcp_t *pkt, const uint8_t *src_mac)
             t->snd_una = pkt->ack_seq;
             t->snd_wnd = pkt->window;
             t->state   = TCP_ESTABLISHED;
-            send_flags(t, TCP_ACK);
             uint32_t rtt = (uint32_t)(now_ms - (t->rto_expire - 1000));
             update_rtt(t, rtt);
+            /* Preemptive ACK burst: Windows OS stack may see this SYN-ACK
+             * and send a RST (no matching socket). Flood the peer with ACKs
+             * to win the race — the first one that arrives establishes the
+             * connection before the RST can kill it. No recv_dispatch() in
+             * between, so nothing delays us. */
+            send_ack(t);
+            send_ack(t);
+            send_ack(t);
         } else if (t->state == TCP_SYN_RECEIVED) {
             send_flags(t, TCP_SYN | TCP_ACK);   /* duplicate SYN */
         }
