@@ -1,257 +1,252 @@
 # VLAN Tag Switch Test Tool (Windows)
 
-基于 WinPcap/Npcap 的 VLAN tag 报文测试工具，**模拟交换机行为**，报文到 3 层 (IP+UDP)，**VLAN tag 可选**。支持 **iperf 带宽测试**。
+基于 WinPcap/Npcap 的**用户态 TCP/IP 协议栈**测试工具，支持 **TCP/UDP 双栈**、**原生 VLAN tag**、**iperf 等效打流**。所有报文通过原始以太网帧发送，**不依赖操作系统 TCP 栈**。
 
 ## 文件结构
 
 ```
 .
-├── vlan_tag_switch.c   # 主程序（-s 服务端, -c 客户端, -t iperf测试）
-├── Makefile            # 编译脚本
-└── README.md           # 说明文档
+├── src/
+│   ├── net.h / net.c          # 核心数据结构、校验和、帧构建/解析
+│   ├── tcp_fsm.h / tcp_fsm.c  # TCP 状态机 (RFC 793/1122)、Reno 拥塞控制
+│   ├── platform.h / platform.c # pcap 收发、ARP、定时器、网卡管理
+│   ├── report.h / report.c    # iperf 格式 + JSON 输出
+│   └── main.c                 # CLI + 事件驱动主循环
+├── Makefile
+└── README.md
 ```
 
 ---
 
-## 工作原理
+## 架构
 
 ```
-┌──────────┐   VLAN+IP+UDP frame   ┌──────────┐   VLAN+IP+UDP frame   ┌──────────┐
-│  Client  │ ──────────────────── > │ Firewall │ ──────────────────── > │  Server  │
-│          │   MAC+[VLAN]+IP+UDP+data│          │                        │          │
-│          │ <────────────────────  │          │ <────────────────────  │          │
-└──────────┘   Reply with VLAN tag  └──────────┘   Reply with VLAN tag  └──────────┘
+┌─────────────────────────────────────────────────────────┐
+│                      main.c                              │
+│  CLI → 事件循环 (timer_walk / send_pending / recv_dispatch) │
+├─────────────────────────────────────────────────────────┤
+│                    tcp_fsm.c                             │
+│  TCP 状态机: CLOSED→SYN_SENT→ESTABLISHED→FIN_WAIT→TIME_WAIT │
+│  Reno: 慢启动 / 拥塞避免 / 快速重传 / 快速恢复              │
+│  RTT/RTO: RFC 6298    Checksum: RFC 1071 (伪首部)         │
+├─────────────────────────────────────────────────────────┤
+│                 platform.c / net.c                       │
+│  发送: Eth → [VLAN] → IPv4 → TCP/UDP → pcap_sendpacket   │
+│  接收: pcap_next_ex → 解析 → 分发到 FSM                   │
+│  TCB 查找: 5-tuple + VLAN ID (严格隔离)                    │
+└─────────────────────────────────────────────────────────┘
 ```
 
-**核心行为**：
-1. **发送时**：payload → UDP头 → IP头 → [VLAN tag] → 以太网头 → 发送
-2. **接收时**：收到帧 → 剥以太网头 → [剥VLAN tag] → 剥IP/UDP头 → 提取 payload 打印
-3. **自动 ARP 解析**：只需知道对端 IP，自动获取 MAC 地址
-4. **VLAN 可选**：不指定 `-v` 时不带 VLAN tag，指定 `-v <vlan_id>` 时带 VLAN tag
+**设计原则**：
+1. **所有 TCP 报文 = 手构建帧通过 pcap 发送** — 无 OS TCP 栈 (无 bind/connect/socket)
+2. **所有 TCP 接收 = pcap 捕获 + 手解析** — 通过 pcap_next_ex/dispatch
+3. **VLAN tag 是一等公民** — 可选 (vlan_id=0 表示无 tag)
+4. **事件驱动状态机** — 非阻塞单线程循环，无 sleep(1)
+5. **5-tuple + VLAN TCB 查找** — VLAN 始终参与 key 匹配
+6. **软件校验和** (IP + TCP/UDP 伪首部)
+7. **pcap_open_live timeout = 100ms** — 避免 Npcap BSOD
+8. **所有发送缓冲区静态/全局/malloc** — 不在栈上
 
 ---
 
 ## 环境要求
 
-1. **WinPcap 或 Npcap** 运行时库
+1. **Npcap 运行时库** (推荐)
    - 下载地址: https://npcap.com/#download
    - 安装时勾选 "Install Npcap in WinPcap API-compatible Mode"
 
-2. **WinPcap/Npcap SDK**（编译时需要）
-   - WinPcap SDK: https://www.winpcap.org/devel.htm (WpdPack)
+2. **Npcap SDK** (编译时需要)
+   - 下载: https://npcap.com/#download (SDK 包)
+   - 默认路径: `C:\WpdPack`
 
-3. **编译器**：MinGW-w64 或 Visual Studio
+3. **编译器**: MinGW-w64 (clang 或 gcc)
 
 ---
 
 ## 编译
 
 ```bash
-# MinGW (需要确保 mingw64\bin 在 PATH 中优先于 Git for Windows 的 mingw64\bin)
-set PATH=C:\msys64\mingw64\bin;%PATH%
-mingw32-make
+# 使用 Makefile (自动检测 WpdPack 路径)
+make
 
 # 或手动编译
-gcc -Wall -O2 -IC:\npcap-sdk-1.16\Include -o vlan_tag_switch.exe vlan_tag_switch.c ^
-    -LC:\npcap-sdk-1.16\Lib\x64 -lwpcap -lPacket -lws2_32 -liphlpapi
+clang -Wall -Wextra -O2 -std=c11 -DUSE_WINPCAP -Ic:/WpdPack/Include -Isrc ^
+    -o vlan_tag_switch.exe src/main.c src/net.c src/tcp_fsm.c src/platform.c src/report.c ^
+    -lws2_32 -liphlpapi -lwinmm -lshlwapi -Lc:/WpdPack/Lib/x64 -lwpcap -lPacket
 ```
-
-> **注意**：如果安装了 Git for Windows，确保 MSYS2 的 `mingw64\bin` 在 PATH 中排在 Git 的 `mingw64\bin` 之前，否则会因 DLL 版本冲突导致编译失败（无错误输出，直接退出）。
 
 ---
 
 ## 使用方法
 
-### 1. 列出可用网卡
-
-```bash
-vlan_tag_switch.exe -l
-```
-
-### 2. 服务端模式
-
-```bash
-vlan_tag_switch.exe -s [-p <port>] [-a <ip>] [-v <vlan_id>]
-```
+### 通用参数
 
 | 参数 | 说明 | 默认值 |
 |---|---|---|
 | `-s` | 服务端模式 | - |
-| `-p <port>` | 监听端口 | 9999 |
-| `-a <ip>` | 监听 IP | 自动获取 |
-| `-v <vlan_id>` | VLAN ID（可选，不指定则不带 VLAN） | 无 VLAN |
+| `-c <host>` | 客户端模式，指定服务端 IP | - |
+| `-p <port>` | 端口 | 9999 |
+| `-u` | UDP 模式 (默认 TCP) | TCP |
+| `-b #[KMG]` | 目标带宽 (如 100M, 1G) | 无限制 |
+| `-t <sec>` | 测试持续时间 (秒) | 10 |
+| `-n #[KMG]` | 发送字节数 (优先于 -t) | 0 |
+| `-l <len>` | 发送缓冲区大小 | 1460 |
+| `-i <sec>` | 报告间隔 (秒) | 1 |
+| `-P <N>` | 并行流数量 | 1 |
+| `-V <id>` | VLAN ID (1-4094, 默认无 VLAN) | 无 |
+| `--pcp <n>` | VLAN PCP 优先级 (0-7) | 0 |
+| `-B <addr>` | 绑定网卡 (IP 或名称子串, 默认首张网卡) | 0.0.0.0 |
+| `-T <sec>` | 服务端静默超时 (秒) | 3 |
+| `-J` | JSON 格式输出 | - |
+| `-v` | 详细输出 | - |
+| `-h` | 帮助 | - |
 
-### 3. 客户端交互模式
+### 示例
 
+#### TCP 带宽测试 (单流)
+
+**服务端**:
 ```bash
-vlan_tag_switch.exe -c <server_ip:port> [-v <vlan_id>] [-i]
+vlan_tag_switch.exe -s -p 9999
 ```
 
-### 4. iperf 带宽测试模式
-
-**服务端**：
+**客户端** (100Mbps, 30秒):
 ```bash
-vlan_tag_switch.exe -s -p 9999 [-v <vlan_id>]
+vlan_tag_switch.exe -c 192.168.1.100 -b 100M -t 30
 ```
 
-**客户端**：
+#### TCP 带宽测试 (4 并行流, 带 VLAN)
+
+**服务端**:
 ```bash
-vlan_tag_switch.exe -c 192.168.1.100:9999 -t [-b <bw>] [-d <sec>] [-l <len>] [-v <vlan_id>]
+vlan_tag_switch.exe -s -p 9999 -V 100
 ```
 
-| 参数 | 说明 | 默认值 |
-|---|---|---|
-| `-t` | iperf 测试模式 | - |
-| `-b <bandwidth>` | 目标带宽 (100M, 1G) | 无限制 |
-| `-d <duration>` | 测试持续时间（秒） | 10 |
-| `-l <length>` | 报文 payload 大小 | 1400 |
-| `-v <vlan_id>` | VLAN ID（可选） | 无 VLAN |
+**客户端**:
+```bash
+vlan_tag_switch.exe -c 192.168.1.100 -b 1G -t 30 -P 4 -V 100
+```
+
+#### UDP 带宽测试
+
+**服务端**:
+```bash
+vlan_tag_switch.exe -s -p 9999 -u
+```
+
+**客户端** (1Gbps):
+```bash
+vlan_tag_switch.exe -c 192.168.1.100 -u -b 1G -t 30
+```
+
+#### 指定网卡
+
+**按 IP 绑定**:
+```bash
+vlan_tag_switch.exe -s -p 9999 -B 192.168.1.50
+```
+
+**按名称绑定** (模糊匹配):
+```bash
+vlan_tag_switch.exe -s -p 9999 -B "Ethernet"
+```
+
+#### JSON 输出
+
+```bash
+vlan_tag_switch.exe -c 192.168.1.100 -b 1G -t 10 -J
+```
+
+输出示例:
+```json
+{
+  "streams": [
+    {"id": 1, "bytes": 1192092876, "seconds": 10.0, "mbps": 953.67, "retransmits": 0}
+  ]
+}
+```
 
 ---
 
-## 使用示例
+## 输出示例
 
-### 场景 1：不带 VLAN 的交互测试
+### 客户端 (TCP, 100Mbps)
 
-**服务端**（机器 B）：
-```bash
-vlan_tag_switch.exe -s -p 9999
+```
+Bind: 192.168.1.50  MAC=AA:BB:CC:DD:EE:FF  VLAN=100
+Available adapters:
+  [0] Intel(R) Ethernet  192.168.1.50  AA:BB:CC:DD:EE:FF
+  [1] Realtek PCIe GbE   10.0.0.5       11:22:33:44:55:66
+Sniffing on \Device\NPF_{...}
+TCP client: 1 stream(s) -> 192.168.1.100:9999 VLAN=100 buf=1460
+[ ID] Interval       Transfer     Bandwidth
+[  1] 0.00-1.00 sec  11.92 MBytes  100.00 Mbits/sec
+[  2] 1.00-2.00 sec  11.92 MBytes  100.00 Mbits/sec
+...
+[ 30] 29.00-30.00 sec  11.92 MBytes  100.00 Mbits/sec
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[  30]  0.00-30.00 sec  357.5 MBytes  100.00 Mbits/sec
 ```
 
-**客户端**（机器 A）：
-```bash
-vlan_tag_switch.exe -c 192.168.1.100:9999
+### 服务端 (TCP, 接收)
+
 ```
-
-### 场景 2：带 VLAN 的交互测试
-
-**服务端**（机器 B）：
-```bash
-vlan_tag_switch.exe -s -p 9999 -v 100
-```
-
-**客户端**（机器 A）：
-```bash
-vlan_tag_switch.exe -c 192.168.1.100:9999 -v 100
-```
-
-### 场景 3：iperf 带宽测试（带 VLAN）
-
-**服务端**（机器 B）：
-```bash
-vlan_tag_switch.exe -s -p 9999 -v 100
-```
-
-**客户端** - 测试 100Mbps：
-```bash
-vlan_tag_switch.exe -c 192.168.1.100:9999 -t -b 100M -d 30 -v 100
-```
-
-**客户端** - 测试 1Gbps：
-```bash
-vlan_tag_switch.exe -c 192.168.1.100:9999 -t -b 1G -d 30 -l 1400 -v 100
-```
-
-### 场景 4：iperf 带宽测试（不带 VLAN）
-
-**服务端**（机器 B）：
-```bash
-vlan_tag_switch.exe -s -p 9999
-```
-
-**客户端** - 无限制打满：
-```bash
-vlan_tag_switch.exe -c 192.168.1.100:9999 -t -d 30
-```
-
-### iperf 输出示例
-
-**客户端输出**（带 VLAN 100）：
-```
---- iperf 客户端测试 ---
-  目标: 192.168.1.100:9999
-  VLAN: 100
-  包大小: 1400 bytes (payload)
-  目标带宽: 100.00 Mbps
-  持续时间: 30 秒
-========================================
-
-  [  1.0s] 11.92 MB  100.00 Mbps  ~8517 packets
-  [  2.0s] 11.92 MB  100.00 Mbps  ~8517 packets
-  ...
-  [ 30.0s] 11.92 MB  100.00 Mbps  ~8517 packets
-
-========================================
-  [测试完成]
-  总时间: 30.00 秒
-  总数据: 357.50 MB
-  总包数: 255510
-  平均带宽: 100.00 Mbps
-========================================
-```
-
-**服务端输出**（不带 VLAN）：
-```
---- iperf 服务端接收 ---
-  监听端口: 9999
-  VLAN: 无
-========================================
-
-  [首个报文] 来自 192.168.1.101:52341
-  [  1.0s] 11.92 MB  100.00 Mbps  ~8517 pkts  lost=0 (0.0%)
-  [  2.0s] 11.92 MB  100.00 Mbps  ~8517 pkts  lost=0 (0.0%)
-  ...
-  [ 30.0s] 11.92 MB  100.00 Mbps  ~8517 pkts  lost=3 (0.001%)
-
-========================================
-  [接收完成]
-  总时间: 30.00 秒
-  总数据: 357.50 MB
-  总包数: 255510
-  丢包数: 3 (0.001%)
-  平均带宽: 100.00 Mbps
-========================================
+Bind: 192.168.1.50  MAC=AA:BB:CC:DD:EE:FF  VLAN=100
+Available adapters:
+  [0] Intel(R) Ethernet  192.168.1.50  AA:BB:CC:DD:EE:FF
+Sniffing on \Device\NPF_{...}
+TCP server: port=9999 VLAN=100 bind=0.0.0.0 (listening...)
+[ ID] Interval       Transfer     Bandwidth
+[  1] 0.00-1.00 sec  11.92 MBytes  100.00 Mbits/sec
+[  2] 1.00-2.00 sec  11.92 MBytes  100.00 Mbits/sec
+...
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[  30]  0.00-30.00 sec  357.5 MBytes  100.00 Mbits/sec
 ```
 
 ---
 
 ## 报文格式
 
-**带 VLAN 时**：
+**带 VLAN 时** (最大 1522 字节):
 ```
-+-------------------+-------------------+
-|  目的 MAC (6B)    |   源 MAC (6B)     |
-+-------------------+-------------------+
-|  TPID 0x8100 (2B) |  TCI (2B)         |  ← VLAN Tag (4B, 可选)
-+-------------------+-------------------+
-|  IP Header (20B)  |  UDP Header (8B)  |  ← 3 层
-+-------------------+-------------------+
-|   Payload         |                   |
-+-------------------+-------------------+
+ DMAC(6) | SMAC(6) | TPID 0x8100(2) | TCI(2) | EtherType(2) | IP(20) | TCP(20) | Payload(≤1460) | FCS(4)
 ```
 
-**不带 VLAN 时**：
+**不带 VLAN 时** (最大 1518 字节):
 ```
-+-------------------+-------------------+
-|  目的 MAC (6B)    |   源 MAC (6B)     |
-+-------------------+-------------------+
-|  EtherType 0x0800 |  IP Header (20B)  |  ← 3 层
-+-------------------+-------------------+
-|  UDP Header (8B)  |   Payload         |
-+-------------------+-------------------+
+ DMAC(6) | SMAC(6) | EtherType 0x0800(2) | IP(20) | TCP(20) | Payload(≤1460) | FCS(4)
 ```
 
-- **TPID**: 0x8100 (802.1Q Tag Protocol Identifier)
-- **TCI**: PCP (3bit) + DEI (1bit) + VID (12bit)
-- **IP 协议**: UDP (17)
-- **VLAN 可选**: 不指定 `-v` 时不带 VLAN tag，指定 `-v <vlan_id>` 时带 VLAN tag
+- **MSS**: 1460 (无 VLAN) / 1456 (带 VLAN)
+- **TPID**: 0x8100 (802.1Q)
+- **TCI**: PCP(3bit) + DEI(1bit) + VID(12bit)
+
+---
+
+## 技术规格
+
+| 特性 | 实现 |
+|---|---|
+| TCP 状态机 | RFC 793 + RFC 1122 |
+| 拥塞控制 | Reno (慢启动 / 拥塞避免 / 快速重传 / 快速恢复) |
+| RTO 计算 | RFC 6298 (SRTT = 7/8·SRTT + 1/8·RRT, RTTVAR = 3/4·RTTVAR + 1/4·\|Δ\|) |
+| RTO 退避 | RFC 2988 §5.5 (RTO = min(RTO·2, RTO_MAX)) |
+| 快速重传 | RFC 5681 (3 dup ACK, 仅在 recover 期间触发) |
+| 快速恢复退出 | RFC 5681 §3.2 (RTO 必须无条件退出 Fast Recovery) |
+| 校验和 | RFC 1071 (IP + TCP/UDP 伪首部) |
+| 序列号比较 | SEQ_LT/LEQ/GT/GEQ 宏 (处理 32 位回绕) |
+| TCB 查找 | 5-tuple + VLAN ID (严格隔离, 无条件编译) |
+| 并行流 | 每流独立 TCB / 拥塞控制 / pacing |
+| Pacing | 事件驱动 + 速率限制 (busy-spin 安全) |
+| 输出格式 | iperf 兼容 + JSON |
 
 ---
 
 ## 常见问题
 
 ### 找不到适配器
-运行 `vlan_tag_switch.exe -l` 查看可用适配器列表。
+启动时会自动列出所有可用适配器。使用 `-B` 按 IP 或名称绑定。
 
 ### ARP 解析失败
 - 检查客户端和服务端是否在同一子网
@@ -259,7 +254,21 @@ vlan_tag_switch.exe -c 192.168.1.100:9999 -t -d 30
 
 ### 无回复/超时
 - 检查防火墙是否允许带 VLAN tag 的报文通过
+- 确认两端 VLAN ID 一致
+
+### 多网卡环境
+- 使用 `-B <ip>` 或 `-B <name>` 明确绑定网卡
+- 启动时输出的适配器列表可帮助确认选择
 
 ### Win7 兼容性
 - Npcap **1.7x** 是最后支持 Win7 的版本
-- WinPcap 4.1.2 完全支持 Win7
+- snaplen 已设为 2048 (避免 65536 兼容问题)
+
+---
+
+## 注意事项
+
+- **必须以管理员身份运行** (pcap 需要)
+- **对端必须是本工具的另一个实例** (不支持标准 iperf 服务器)
+- TCP 模式下所有报文走原始以太网帧，**操作系统看不到这些连接**
+- Ctrl+C 通过 InterlockedExchange + pcap_breakloop 优雅退出
