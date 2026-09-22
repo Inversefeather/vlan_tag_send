@@ -51,7 +51,12 @@ typedef unsigned long  u_long;
 #define PSEUDO_HDR_LEN   12
 
 #define ETHERTYPE_VLAN   0x8100
-#define ETHERTYPE_IP     0x0800
+/* 0x88B5 = IEEE 802 experimental EtherType. NOT 0x0800 (IPv4):
+ * using the real IPv4 type would make the OS TCP stack on the peer
+ * machine see our SYN and reply with RST (no socket bound to that
+ * port) before our userspace stack can win the race. An unknown
+ * EtherType is ignored by the OS — only our Npcap-based peer sees it. */
+#define ETHERTYPE_IP     0x88B5
 #define ETHERTYPE_ARP    0x0806
 #define IP_PROTOCOL_TCP  6
 #define IP_PROTOCOL_UDP  17
@@ -284,5 +289,8 @@ uint16_t tcp_udp_checksum(uint32_t src_ip, uint32_t dst_ip,
                           uint8_t protocol, const void *data, int len);
 
 uint32_t alloc_iss(void);
+
+/* Debug: hex dump a buffer to stdout. prefix may be NULL. */
+void hex_dump(const uint8_t *data, int len, const char *prefix);
 
 #endif /* NET_H */

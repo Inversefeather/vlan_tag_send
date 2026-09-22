@@ -13,6 +13,8 @@
 #include "platform.h"
 
 volatile LONG g_stop = 0;
+int g_platform_verbose = 0;
+void platform_set_verbose(int v) { g_platform_verbose = v; }
 
 #ifdef USE_WINPCAP
 static pcap_t *g_pcap = NULL;
@@ -194,6 +196,39 @@ int platform_find_adapter_by_ip(uint32_t ip)
  *        (plain):  DMAC(6) SMAC(6) ETYPE(2)                 IP(20) TCP(20) payload
  * -------------------------------------------------------------------*/
 
+/* ---------------------------------------------------------------------
+ * Debug helpers (defined first: arp_resolve / send paths call log_send)
+ * -------------------------------------------------------------------*/
+const char *fmt_ip(uint32_t ip)
+{
+    static char buf[4][20];
+    static int rot = 0;
+    char *b = buf[rot++ & 3];
+    snprintf(b, 20, "%u.%u.%u.%u",
+             ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
+    return b;
+}
+
+static void log_send(const uint8_t *frame, int len, const char *kind,
+                     uint32_t sip, uint32_t dip, uint16_t sp, uint16_t dp,
+                     uint16_t vlan_id, const char *extra)
+{
+    (void)vlan_id;
+    if (!g_platform_verbose) return;
+    uint16_t et = (frame[12] << 8) | frame[13];
+    printf("[SEND] %s %s:%u -> %s:%u et=0x%04x",
+           kind, fmt_ip(sip), sp, fmt_ip(dip), dp, et);
+    if (et == ETHERTYPE_VLAN) {
+        uint16_t tci = (frame[14] << 8) | frame[15];
+        uint16_t inner = (frame[16] << 8) | frame[17];
+        printf(" VLAN=%u inner=0x%04x", tci & 0xFFF, inner);
+    }
+    printf(" len=%d", len);
+    if (extra) printf(" %s", extra);
+    printf("\n");
+    if (g_platform_verbose > 1) hex_dump(frame, len < 72 ? len : 72, "      ");
+}
+
 /* ARP resolution (used by flow engine before active open) */
 static int arp_resolve(uint32_t my_ip, uint32_t peer_ip, uint8_t *peer_mac,
                        const char *dev_name)
@@ -221,6 +256,7 @@ static int arp_resolve(uint32_t my_ip, uint32_t peer_ip, uint8_t *peer_mac,
     /* target mac zero */
     memcpy(arp + 24, &peer_ip, 4);   /* target ip */
 
+    log_send(frame, 60, "ARP", my_ip, peer_ip, 0, 0, 0, "request");
     pcap_sendpacket(g_pcap, frame, 60);
     free(frame);
 
@@ -231,6 +267,11 @@ static int arp_resolve(uint32_t my_ip, uint32_t peer_ip, uint8_t *peer_mac,
         const uint8_t *pkt;
         int r = pcap_next_ex(g_pcap, &hdr, &pkt);
         if (r == 1 && hdr->len >= 42) {
+            if (g_platform_verbose) {
+                uint16_t et = (pkt[12] << 8) | pkt[13];
+                printf("[RECV] ARP-REPLY et=0x%04x len=%u\n", et, hdr->len);
+                if (g_platform_verbose > 1) hex_dump(pkt, hdr->len < 72 ? (int)hdr->len : 72, "      ");
+            }
             eth_header_t *re = (eth_header_t *)pkt;
             uint16_t et = ntohs(re->ethertype);
             const uint8_t *ra = (uint8_t *)pkt + ETH_HDR_LEN;
@@ -289,8 +330,8 @@ static uint8_t *eth_build_with_vlan(uint8_t *p, const uint8_t *dst, const uint8_
     p[0] = (uint8_t)(tci >> 8);
     p[1] = (uint8_t)(tci & 0xFF);
 
-    /* Inner EtherType = IPv4 (2 bytes) at offset 16-17 */
-    p[2] = 0x08; p[3] = 0x00;
+    /* Inner EtherType (2 bytes) at offset 16-17 */
+    { uint16_t et = htons(ETHERTYPE_IP); memcpy(p + 2, &et, 2); }
 
     return p + VLAN_TAG_LEN;  /* VLAN_TAG_LEN=4: TCI(2)+EtherType(2) -> offset 18 */
 }
@@ -352,6 +393,18 @@ int raw_send_segment(const tcb_t *tcb, const uint8_t *tcp_payload,
     p += TCP_HDR_LEN + payload_len;
     int len = (int)(p - frame);
 
+    /* Pad to minimum Ethernet frame (60 bytes without FCS).
+     * A bare TCP SYN is only 54 bytes (14+20+20); some NICs/Npcap
+     * reject or corrupt frames below the minimum. UDP datagrams with
+     * a full payload already exceed this, so the memset is a no-op. */
+    if (len < 60) {
+        memset(frame + len, 0, 60 - len);
+        len = 60;
+    }
+
+    log_send(frame, len, "TCP", tcb->local_ip, tcb->remote_ip,
+             tcb->local_port, tcb->remote_port, tcb->vlan_id, NULL);
+
     if (pcap_sendpacket(g_pcap, frame, len) != 0) {
         fprintf(stderr, "Error: pcap_sendpacket: %s\n", pcap_geterr(g_pcap));
         return -1;
@@ -402,6 +455,13 @@ int raw_send_udp(uint32_t src_ip, const uint8_t *src_mac,
     p += UDP_HDR_LEN + payload_len;
 
     int len = (int)(p - frame);
+    /* pad to minimum Ethernet frame (60 bytes without FCS) */
+    if (len < 60) {
+        memset(frame + len, 0, 60 - len);
+        len = 60;
+    }
+    log_send(frame, len, "UDP", src_ip, dst_ip, sport, dport, vlan_id, NULL);
+
     if (pcap_sendpacket(g_pcap, frame, len) != 0) {
         fprintf(stderr, "Error: pcap_sendpacket: %s\n", pcap_geterr(g_pcap));
         return -1;
@@ -505,6 +565,16 @@ int platform_recv_dispatch(udp_rx_cb_t cb, void *ctx)
     int pkt_len = (int)hdr->len;
     if (pkt_len < ETH_HDR_LEN + IPV4_HDR_LEN + 8) return 0;
 
+    if (g_platform_verbose) {
+        uint16_t et_raw = (pkt[12] << 8) | pkt[13];
+        printf("[RECV] et=0x%04x len=%d", et_raw, pkt_len);
+        if (et_raw == ETHERTYPE_VLAN) {
+            uint16_t tci = (pkt[14] << 8) | pkt[15];
+            uint16_t inner = (pkt[16] << 8) | pkt[17];
+            printf(" VLAN=%u inner=0x%04x", tci & 0xFFF, inner);
+        }
+    }
+
     /* --- eth_parse --- */
     eth_header_t *eth = (eth_header_t *)pkt;
     uint16_t et = ntohs(eth->ethertype);
@@ -522,7 +592,10 @@ int platform_recv_dispatch(udp_rx_cb_t cb, void *ctx)
         /* inner ethertype = bytes at offset ETH_HDR_LEN+2..+3 (after TPID) */
         et = (uint16_t)((pkt[ETH_HDR_LEN + 2] << 8) | pkt[ETH_HDR_LEN + 3]);
     }
-    if (et != ETHERTYPE_IP) return 0;
+    if (et != ETHERTYPE_IP) {
+        if (g_platform_verbose) printf(" -> SKIP (et=0x%04x != 0x%04x)\n", et, ETHERTYPE_IP);
+        return 0;
+    }
 
     /* --- ipv4_parse --- */
     ipv4_header_t *ip = (ipv4_header_t *)l3;
@@ -532,6 +605,11 @@ int platform_recv_dispatch(udp_rx_cb_t cb, void *ctx)
     if (total_len > l3_len) total_len = l3_len;
 
     if (ip->protocol == IP_PROTOCOL_UDP && cb) {
+        if (g_platform_verbose)
+            printf(" UDP %s:%u -> %s:%u pay=%d\n",
+                   fmt_ip(ip->src), ntohs(((udp_header_t *)(l3 + ihl))->sport),
+                   fmt_ip(ip->dst), ntohs(((udp_header_t *)(l3 + ihl))->dport),
+                   total_len - ihl - UDP_HDR_LEN);
         /* UDP mode: hand raw frame to callback */
         cb(pkt, pkt_len, ctx);
         return 1;
@@ -564,6 +642,21 @@ int platform_recv_dispatch(udp_rx_cb_t cb, void *ctx)
     parsed.window     = ntohs(tcp->window);
     parsed.payload    = (uint8_t *)(tp + tcp_doff);
     parsed.payload_len = tp_len - tcp_doff;
+
+    if (g_platform_verbose) {
+        char fb[64];
+        int n = 0;
+        if (tcp->flags & TCP_SYN) n += snprintf(fb + n, sizeof(fb) - n, "SYN ");
+        if (tcp->flags & TCP_ACK) n += snprintf(fb + n, sizeof(fb) - n, "ACK ");
+        if (tcp->flags & TCP_FIN) n += snprintf(fb + n, sizeof(fb) - n, "FIN ");
+        if (tcp->flags & TCP_RST) n += snprintf(fb + n, sizeof(fb) - n, "RST ");
+        if (tcp->flags & TCP_PSH) n += snprintf(fb + n, sizeof(fb) - n, "PSH ");
+        if (n > 0) fb[n - 1] = '\0';
+        else snprintf(fb, sizeof(fb), "0x%02x", tcp->flags);
+        printf(" TCP %s:%u -> %s:%u %s seq=%u ack=%u pay=%d\n",
+               fmt_ip(ip->src), parsed.sport, fmt_ip(ip->dst), parsed.dport,
+               fb, parsed.seq, parsed.ack_seq, parsed.payload_len);
+    }
 
     /* --- dispatch to FSM --- */
     tcp_fsm_input(&parsed, eth->src);

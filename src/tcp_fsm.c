@@ -14,6 +14,26 @@
 /* platform send (defined in platform.c) */
 extern int raw_send_segment(const tcb_t *tcb, const uint8_t *tcp_payload,
                             int payload_len, uint8_t flags);
+extern int g_platform_verbose;
+extern const char *fmt_ip(uint32_t ip);
+
+static const char *tcp_state_name(tcp_state_t s)
+{
+    switch (s) {
+    case TCP_CLOSED:       return "CLOSED";
+    case TCP_LISTEN:       return "LISTEN";
+    case TCP_SYN_SENT:     return "SYN_SENT";
+    case TCP_SYN_RECEIVED: return "SYN_RECEIVED";
+    case TCP_ESTABLISHED:  return "ESTABLISHED";
+    case TCP_FIN_WAIT_1:   return "FIN_WAIT_1";
+    case TCP_FIN_WAIT_2:   return "FIN_WAIT_2";
+    case TCP_CLOSE_WAIT:   return "CLOSE_WAIT";
+    case TCP_CLOSING:      return "CLOSING";
+    case TCP_LAST_ACK:     return "LAST_ACK";
+    case TCP_TIME_WAIT:    return "TIME_WAIT";
+    }
+    return "?";
+}
 
 /* ---------------------------------------------------------------------
  * Fast recovery state
@@ -456,6 +476,10 @@ void tcp_fsm_input(const parsed_tcp_t *pkt, const uint8_t *src_mac)
 
     /* --- pure SYN (active open arriving at a listener) --- */
     if ((pkt->flags & (TCP_SYN | TCP_ACK)) == TCP_SYN) {
+        if (g_platform_verbose)
+            printf("[FSM] SYN %s:%u -> %s:%u vlan=%u\n",
+                   fmt_ip(pkt->src_ip), pkt->sport,
+                   fmt_ip(pkt->dst_ip), pkt->dport, pkt->vlan_id);
         for (tcb_t *l = g_tcb_list; l; l = l->next) {
             if (l->state != TCP_LISTEN) continue;
             if (l->vlan_id != (pkt->vlan_id)) continue;
@@ -501,6 +525,10 @@ void tcp_fsm_input(const parsed_tcp_t *pkt, const uint8_t *src_mac)
             t->rcv_nxt = pkt->seq + 1;
             t->snd_una = pkt->ack_seq;
             t->snd_wnd = pkt->window;
+            if (g_platform_verbose)
+                printf("[FSM] %s:%u -> SYN-ACK received, %s -> ESTABLISHED\n",
+                       fmt_ip(t->remote_ip), t->remote_port,
+                       tcp_state_name(t->state));
             t->state   = TCP_ESTABLISHED;
             uint32_t rtt = (uint32_t)(now_ms - (t->rto_expire - 1000));
             update_rtt(t, rtt);
@@ -560,6 +588,9 @@ void tcp_fsm_input(const parsed_tcp_t *pkt, const uint8_t *src_mac)
         if (t->state == TCP_SYN_RECEIVED && (pkt->flags & TCP_ACK)) {
             t->snd_una = pkt->ack_seq;
             t->snd_wnd = pkt->window;
+            if (g_platform_verbose)
+                printf("[FSM] %s:%u SYN_RECEIVED -> ESTABLISHED (peer ACK received)\n",
+                       fmt_ip(t->remote_ip), t->remote_port);
             t->state   = TCP_ESTABLISHED;
             send_ack(t);
         }

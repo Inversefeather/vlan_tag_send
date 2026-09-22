@@ -677,6 +677,7 @@ int main(int argc, char **argv)
 
     platform_set_timer_resolution();
     platform_install_ctrl_handler();
+    platform_set_verbose(g_cfg.verbose);
 
     /* determine local IP / MAC: by IP, by name substring, or default */
     uint32_t local_ip = 0;

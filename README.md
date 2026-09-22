@@ -215,12 +215,16 @@ TCP server: port=9999 VLAN=100 bind=0.0.0.0 (listening...)
 
 **不带 VLAN 时** (最大 1518 字节):
 ```
- DMAC(6) | SMAC(6) | EtherType 0x0800(2) | IP(20) | TCP(20) | Payload(≤1460) | FCS(4)
+ DMAC(6) | SMAC(6) | EtherType 0x88B5(2) | IP(20) | TCP(20) | Payload(≤1460) | FCS(4)
 ```
 
 - **MSS**: 1460 (无 VLAN) / 1456 (带 VLAN)
 - **TPID**: 0x8100 (802.1Q)
 - **TCI**: PCP(3bit) + DEI(1bit) + VID(12bit)
+- **EtherType**: `0x88B5` (IEEE 802 实验类型), **不是** `0x0800` (IPv4)。
+  原因: 若用 0x0800, 对端机器的 OS 协议栈会看到 SYN 并回 RST (无 socket 监听该端口),
+  本软件的对端永远抢不过 OS。0x88B5 是 OS 不认识的类型, 完全忽略, 只有 Npcap 捕获层能看到。
+  Wireshark 默认不解析该类型为 IPv4, 如需查看可手动解码或配置 Wireshark 的 "Decode As"。
 
 ---
 
@@ -239,6 +243,7 @@ TCP server: port=9999 VLAN=100 bind=0.0.0.0 (listening...)
 | TCB 查找 | 5-tuple + VLAN ID (严格隔离, 无条件编译) |
 | 并行流 | 每流独立 TCB / 拥塞控制 / pacing |
 | Pacing | 事件驱动 + 速率限制 (busy-spin 安全) |
+| EtherType | 0x88B5 (避开 OS 协议栈, 避免 RST 抢占) |
 | 输出格式 | iperf 兼容 + JSON |
 
 ---

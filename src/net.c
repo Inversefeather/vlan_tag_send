@@ -83,6 +83,29 @@ uint16_t tcp_udp_checksum(uint32_t src_ip, uint32_t dst_ip,
 }
 
 /* ---------------------------------------------------------------------
+ * Hex dump (debug aid)
+ * -------------------------------------------------------------------*/
+void hex_dump(const uint8_t *data, int len, const char *prefix)
+{
+    for (int i = 0; i < len; i += 16) {
+        if (prefix) printf("%s", prefix);
+        printf("%04x: ", i);
+        int n = len - i;
+        if (n > 16) n = 16;
+        for (int j = 0; j < 16; j++) {
+            if (j < n) printf("%02x ", data[i + j]);
+            else printf("   ");
+        }
+        printf(" ");
+        for (int j = 0; j < n; j++) {
+            uint8_t c = data[i + j];
+            printf("%c", (c >= 32 && c < 127) ? c : '.');
+        }
+        printf("\n");
+    }
+}
+
+/* ---------------------------------------------------------------------
  * Initial Sequence Number (time-based, RFC 793)
  * -------------------------------------------------------------------*/
 

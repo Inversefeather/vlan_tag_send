@@ -30,6 +30,10 @@ int  platform_install_ctrl_handler(void);
 /* Atomic stop flag (set by ctrl handler). */
 extern volatile LONG g_stop;
 
+/* Global verbose flag: when set, send/parse paths print diagnostics. */
+extern int g_platform_verbose;
+void platform_set_verbose(int v);
+
 /* High-resolution time (milliseconds). */
 uint64_t time_now_ms(void);
 
