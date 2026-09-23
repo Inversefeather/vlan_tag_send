@@ -51,16 +51,24 @@ typedef unsigned long  u_long;
 #define PSEUDO_HDR_LEN   12
 
 #define ETHERTYPE_VLAN   0x8100
-/* 0x88B5 = IEEE 802 experimental EtherType. NOT 0x0800 (IPv4):
- * using the real IPv4 type would make the OS TCP stack on the peer
- * machine see our SYN and reply with RST (no socket bound to that
- * port) before our userspace stack can win the race. An unknown
- * EtherType is ignored by the OS — only our Npcap-based peer sees it. */
-#define ETHERTYPE_IP     0x88B5
+#define ETHERTYPE_IP     0x0800
 #define ETHERTYPE_ARP    0x0806
-#define IP_PROTOCOL_TCP  6
+/* IP protocol values for the two TCP modes:
+ *   IPPROTO_TCP (6) = real TCP — OS kernel sees it, may RST (needs WinDivert)
+ *   IP_PROTO_PRIV (250) = experimental — kernel ignores it, no RST */
+#include <ws2tcpip.h>  /* pulls in IPPROTO_TCP (6) */
+#define IP_PROTO_PRIV    250
 #define IP_PROTOCOL_UDP  17
 #define IP_FRAG_DF       0x4000
+
+/* TCP operating mode: real (proto 6) or pseudo (proto 250) */
+typedef enum {
+    MODE_REAL_TCP = 0,      /* IP proto = 6, kernel may RST, needs WinDivert */
+    MODE_PSEUDO_TCP = 1     /* IP proto = 250, kernel ignores, no RST */
+} tcp_mode_t;
+
+/* Global mode selector (defined in net.c). Default: MODE_PSEUDO_TCP. */
+extern tcp_mode_t g_tcp_mode;
 
 #define VLAN_VID_MASK    0x0FFF
 #define VLAN_PCP_SHIFT   13

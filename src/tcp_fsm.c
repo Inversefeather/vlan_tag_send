@@ -532,11 +532,18 @@ void tcp_fsm_input(const parsed_tcp_t *pkt, const uint8_t *src_mac)
             t->state   = TCP_ESTABLISHED;
             uint32_t rtt = (uint32_t)(now_ms - (t->rto_expire - 1000));
             update_rtt(t, rtt);
-            /* Preemptive ACK burst: Windows OS stack may see this SYN-ACK
-             * and send a RST (no matching socket). Flood the peer with ACKs
-             * to win the race — the first one that arrives establishes the
-             * connection before the RST can kill it. No recv_dispatch() in
-             * between, so nothing delays us. */
+            /* Preemptive ACK burst: flood the peer with ACKs so the
+             * server's SYN_RECEIVED -> ESTABLISHED transition happens
+             * reliably. 10 back-to-back ACKs with no recv_dispatch() in
+             * between — nothing delays us, and even if a few are lost the
+             * rest push the connection all the way to ESTABLISHED. */
+            send_ack(t);
+            send_ack(t);
+            send_ack(t);
+            send_ack(t);
+            send_ack(t);
+            send_ack(t);
+            send_ack(t);
             send_ack(t);
             send_ack(t);
             send_ack(t);

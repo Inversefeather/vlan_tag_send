@@ -364,7 +364,7 @@ int raw_send_segment(const tcb_t *tcb, const uint8_t *tcp_payload,
     ip->id       = htons((uint16_t)(GetTickCount() & 0xFFFF));
     ip->frag_off = htons(IP_FRAG_DF);
     ip->ttl      = 64;
-    ip->protocol = IP_PROTOCOL_TCP;
+    ip->protocol = (g_tcp_mode == MODE_PSEUDO_TCP) ? IP_PROTO_PRIV : IPPROTO_TCP;
     ip->src      = tcb->local_ip;
     ip->dst      = tcb->remote_ip;
     ip->checksum = inet_checksum(ip, IPV4_HDR_LEN);
@@ -387,9 +387,12 @@ int raw_send_segment(const tcb_t *tcb, const uint8_t *tcp_payload,
     }
 
     /* TCP checksum over header + payload + pseudo-header */
-    tcp->checksum = tcp_udp_checksum(tcb->local_ip, tcb->remote_ip,
-                                     IP_PROTOCOL_TCP, tcp,
-                                     TCP_HDR_LEN + payload_len);
+    {
+        uint8_t proto = (g_tcp_mode == MODE_PSEUDO_TCP) ? IP_PROTO_PRIV : IPPROTO_TCP;
+        tcp->checksum = tcp_udp_checksum(tcb->local_ip, tcb->remote_ip,
+                                         proto, tcp,
+                                         TCP_HDR_LEN + payload_len);
+    }
     p += TCP_HDR_LEN + payload_len;
     int len = (int)(p - frame);
 
@@ -526,8 +529,11 @@ int platform_open_sniffer(uint32_t bind_ip, const char *name)
 
 open_it:
     /* snaplen: 2048 is plenty for Eth+VLAN+IP+TCP+MSS (max ~1542 bytes).
-     * Some Npcap versions reject 65536 on older Windows. */
-    g_pcap = pcap_open_live(dev_name, 2048, 1, 100, errbuf);
+     * Some Npcap versions reject 65536 on older Windows.
+     * read timeout = 1 ms: the client needs the fastest possible poll
+     * loop so its SYN+ACK preemptive ACK burst reaches the peer before
+     * anything else can intervene. */
+    g_pcap = pcap_open_live(dev_name, 2048, 1, 1, errbuf);
     if (!g_pcap) {
         fprintf(stderr, "Error: pcap_open_live(%s): %s\n", dev_name, errbuf);
         return -1;
@@ -614,7 +620,11 @@ int platform_recv_dispatch(udp_rx_cb_t cb, void *ctx)
         cb(pkt, pkt_len, ctx);
         return 1;
     }
-    if (ip->protocol != IP_PROTOCOL_TCP) return 0;
+    /* Accept the protocol matching the current mode */
+    {
+        uint8_t expect = (g_tcp_mode == MODE_PSEUDO_TCP) ? IP_PROTO_PRIV : IPPROTO_TCP;
+        if (ip->protocol != expect) return 0;
+    }
 
     /* --- tcp_parse --- */
     const uint8_t *tp = l3 + ihl;

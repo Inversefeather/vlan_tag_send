@@ -21,32 +21,12 @@
  *   - JSON output (-J)
  *   - Optional VLAN (-V, default off)
  */
+#include "main.h"
 #include "platform.h"
 #include "report.h"
+#include "rst_killer.h"
+#include "iperf.h"
 #include <shlwapi.h>  /* StrStrIA */
-
-/* ---------------------------------------------------------------------
- * Config
- * -------------------------------------------------------------------*/
-typedef struct {
-    int         is_server;
-    int         proto;          /* PROTO_TCP or PROTO_UDP */
-    int         port;
-    char        host[64];
-    int         duration;       /* seconds (client) */
-    uint64_t    num_bytes;      /* 0 = use duration */
-    int         bufsize;
-    double      target_bps;     /* 0 = unlimited */
-    int         report_interval;
-    int         streams;        /* parallel (TCP: N TCBs; UDP: N sockets) */
-    uint16_t    vlan_id;
-    uint8_t     pcp;
-    int         verbose;
-    int         silence_timeout;
-    int         json;           /* -J */
-    uint32_t    bind_ip;        /* 0 = 0.0.0.0 (all interfaces / first adapter) */
-    char        bind_name[128]; /* adapter name/description substring match */
-} cli_config_t;
 
 static cli_config_t g_cfg;
 
@@ -98,15 +78,21 @@ static void usage(const char *p)
     printf("  -T, --timeout    #        server silence timeout (default 3)\n");
     printf("  -B, --bind       addr   bind IP or adapter name (default: first NIC)\n");
     printf("  -J, --json               JSON output\n");
-    printf("  -v, --verbose            verbose\n\n");
+    printf("  -v, --verbose            verbose\n");
+    printf("      --real-tcp           use real IP protocol 6 (TCP); default is\n");
+    printf("                           pseudo-TCP (proto 250, kernel ignores)\n");
+    printf("      --windivert          enable WinDivert RST protection (only useful\n");
+    printf("                           with --real-tcp; requires driver + admin)\n");
+    printf("      --mode iperf|vlan    backend mode (default: vlan)\n");
+    printf("                           iperf = system TCP/UDP via Winsock\n");
+    printf("                           vlan  = Npcap hand-crafted frames + FSM\n\n");
     printf("Examples:\n");
-    printf("  %s -s -p 9999                     TCP server\n", p);
-    printf("  %s -c 192.168.1.100 -b 100M       TCP client\n", p);
-    printf("  %s -c 192.168.1.100 -u -b 1G      UDP client\n", p);
-    printf("  %s -c 192.168.1.100 -V 100 -b 1G  VLAN client\n", p);
-    printf("  %s -c 192.168.1.100 -P 4 -b 1G    4 parallel streams\n", p);
-    printf("  %s -s -P 8                        multi-stream server\n", p);
-    printf("  %s -c 192.168.1.100 -J            JSON output\n", p);
+    printf("  %s --mode iperf -s -p 9999          iperf TCP server\n", p);
+    printf("  %s --mode iperf -c 192.168.1.100    iperf TCP client\n", p);
+    printf("  %s --mode iperf -c 192.168.1.100 -u -b 1G  iperf UDP client\n", p);
+    printf("  %s --mode iperf -c 192.168.1.100 -B 192.168.1.50  iperf src bind\n", p);
+    printf("  %s -s -p 9999                       VLAN TCP server\n", p);
+    printf("  %s -c 192.168.1.100 -V 100 -b 1G    VLAN client\n", p);
 }
 
 static double parse_bw(const char *s)
@@ -138,6 +124,7 @@ static int parse_args(int argc, char **argv)
     g_cfg.silence_timeout = 3;
     g_cfg.proto = 0; /* TCP */
     g_cfg.bufsize = 0;
+    g_cfg.mode = MODE_VLAN; /* default: Npcap hand-crafted path */
 
     for (int i = 1; i < argc; i++) {
         char *a = argv[i];
@@ -171,6 +158,16 @@ static int parse_args(int argc, char **argv)
         }
         else if (!strcmp(a,"-J")||!strcmp(a,"--json")) g_cfg.json = 1;
         else if (!strcmp(a,"-v")||!strcmp(a,"--verbose")) g_cfg.verbose = 1;
+        else if (!strcmp(a,"--windivert")) g_cfg.windivert = 1;
+        else if (!strcmp(a,"--real-tcp")) g_tcp_mode = MODE_REAL_TCP;
+        else if (!strcmp(a,"--mode")) {
+            if (i+1<argc) {
+                char *m = argv[++i];
+                if (!strcmp(m,"iperf")) g_cfg.mode = MODE_IPERF;
+                else if (!strcmp(m,"vlan")) g_cfg.mode = MODE_VLAN;
+                else { fprintf(stderr,"Unknown mode '%s' (expected iperf|vlan)\n", m); return -1; }
+            } else { fprintf(stderr,"--mode needs an argument\n"); return -1; }
+        }
         else { fprintf(stderr,"Unknown: %s\n", a); return -1; }
     }
     return 0;
@@ -271,6 +268,14 @@ static void tcp_client_flow(uint32_t local_ip, uint8_t *local_mac,
     }
 
     platform_open_sniffer(local_ip, adapter_name);
+
+    /* WinDivert RST protection (opt-in via --windivert): with EtherType
+     * 0x0800 the local Windows kernel sees the server's SYN-ACK and emits
+     * a RST,ACK that races our ACK burst. Drop it before it hits the wire.
+     * Off by default because a WinDivert handle can interfere with the
+     * Npcap send path on some systems. */
+    if (cfg->windivert)
+        rst_killer_start(0, remote_ip, (uint16_t)cfg->port);
 
     /* auto bufsize: account for VLAN tag */
     if (cfg->bufsize <= 0)
@@ -411,6 +416,8 @@ static void tcp_client_flow(uint32_t local_ip, uint8_t *local_mac,
                    total_sec > 0 ? (double)total_bytes * 8.0 / total_sec / 1e6 : 0);
         }
     }
+
+    rst_killer_stop();
 
     free(pattern);
     free(tcbs);
@@ -591,6 +598,14 @@ static void tcp_server_flow(uint32_t bind_ip, const char *adapter_name,
     /* open sniffer on the adapter owning bind_ip (0 = first non-loopback) */
     platform_open_sniffer(bind_ip, adapter_name);
 
+    /* WinDivert RST protection (opt-in via --windivert): with EtherType
+     * 0x0800 the local Windows kernel sees the client's SYN arrive at our
+     * listening port (no kernel socket bound there) and emits a RST back
+     * to the client before our userspace can reply with SYN-ACK. Drop that
+     * kernel RST so the handshake can complete. */
+    if (cfg->windivert)
+        rst_killer_start((uint16_t)cfg->port, 0, 0);
+
     /*
      * create a listening TCB with local_ip = 0 (wildcard).
      * The listener accepts SYN destined to ANY IP on this adapter.
@@ -650,6 +665,8 @@ static void tcp_server_flow(uint32_t bind_ip, const char *adapter_name,
         }
     }
 
+    rst_killer_stop();
+
     double total_sec = (double)(time_now_ms() - start_ms) / 1000.0;
     if (cfg->json) {
         report_json_start();
@@ -679,7 +696,26 @@ int main(int argc, char **argv)
     platform_install_ctrl_handler();
     platform_set_verbose(g_cfg.verbose);
 
-    /* determine local IP / MAC: by IP, by name substring, or default */
+    /* Print operating mode */
+    printf("Run mode: %s\n",
+           (g_cfg.mode == MODE_IPERF) ? "iperf (system TCP/UDP)" : "vlan (Npcap hand-crafted)");
+    if (g_cfg.mode == MODE_VLAN) {
+        printf("TCP mode: %s (IP proto=%d)\n",
+               (g_tcp_mode == MODE_PSEUDO_TCP) ? "PSEUDO" : "REAL",
+               (g_tcp_mode == MODE_PSEUDO_TCP) ? IP_PROTO_PRIV : IPPROTO_TCP);
+        if (g_tcp_mode == MODE_REAL_TCP && !g_cfg.windivert)
+            printf("WARNING: real-TCP mode without --windivert — kernel may RST!\n");
+    }
+
+    /* --- iperf mode: skip Npcap entirely, go straight to Winsock --- */
+    if (g_cfg.mode == MODE_IPERF) {
+        int rc = iperf_run(&g_cfg);
+        platform_restore_timer_resolution();
+        platform_cleanup();
+        return rc;
+    }
+
+    /* --- vlan mode: enumerate adapters for Npcap --- */
     uint32_t local_ip = 0;
     uint8_t local_mac[6] = {0};
     adapter_info_t adapters[32];

@@ -8,6 +8,13 @@
 #include <assert.h>
 
 /* ---------------------------------------------------------------------
+ * Global TCP mode selector (used by send + receive paths).
+ * Default: pseudo-TCP (proto 250) so the kernel never interferes.
+ * main.c sets MODE_REAL_TCP when --real-tcp is passed.
+ * -------------------------------------------------------------------*/
+tcp_mode_t g_tcp_mode = MODE_PSEUDO_TCP;
+
+/* ---------------------------------------------------------------------
  * One's complement checksum (RFC 1071)
  * -------------------------------------------------------------------*/
 
