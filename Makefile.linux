@@ -1,0 +1,23 @@
+#
+# Makefile.linux - Build vlan_tool for Linux
+#
+# Usage:
+#   make -f Makefile.linux
+#   make -f Makefile.linux clean
+#
+CC = gcc
+CFLAGS = -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE
+LDFLAGS = -lm
+TARGET = vlan_tool
+SRC = src/vlan_tool.c
+
+all: $(TARGET)
+	@echo "Built: $(TARGET)"
+
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+clean:
+	rm -f $(TARGET)
+
+.PHONY: all clean
